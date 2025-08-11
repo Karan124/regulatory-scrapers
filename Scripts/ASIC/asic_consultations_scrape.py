@@ -700,10 +700,15 @@ class ASICResourceScraper:
             'pdf_content': [],
             'pdf_checksums': [],
             'related_links': [],
-            'is_withdrawn': False
+            'is_withdrawn': False,
+            'original_page_content': ''
         }
         
         try:
+            # First, extract original page content for debugging
+            original_content = self._extract_main_content()
+            content_data['original_page_content'] = original_content
+            
             # Check for withdrawal and relocation messages
             page_text = self.driver.page_source.lower()
             
@@ -712,46 +717,41 @@ class ASICResourceScraper:
                 content_data['is_withdrawn'] = True
                 self.logger.info(f"Detected withdrawn/relocated guide at {url}")
                 
-                # Look for relocation link with multiple selectors
-                relocation_selectors = [
-                    "//a[contains(@href, '/regulatory-resources/')]",
-                    "//a[contains(@href, '/financial-services/')]", 
-                    "//a[contains(@href, '/reports/')]",
-                    "//a[contains(@title, 'Certificate') or contains(@title, 'qualified accountant')]",
-                    "//a[contains(text(), 'Certificate') or contains(text(), 'qualified accountant')]",
-                    "//p/a[1]",  # First link in a paragraph (common pattern)
-                ]
+                # Enhanced relocation link detection
+                relocation_url = self._find_relocation_link(url)
                 
-                new_url = None
-                for selector in relocation_selectors:
-                    try:
-                        relocation_links = self.driver.find_elements(By.XPATH, selector)
-                        for link in relocation_links:
-                            href = link.get_attribute('href')
-                            if href and href != url and '/regulatory-resources/' in href:
-                                new_url = href
-                                self.logger.info(f"Found relocation link: {new_url}")
-                                break
-                        if new_url:
-                            break
-                    except Exception as e:
-                        continue
-                
-                if new_url:
-                    content_data['relocated_url'] = new_url
+                if relocation_url:
+                    content_data['relocated_url'] = relocation_url
                     
                     # Navigate to new URL and scrape content
                     try:
-                        self.logger.info(f"Following relocation to: {new_url}")
-                        self.driver.get(new_url)
+                        self.logger.info(f"Following relocation from {url} to: {relocation_url}")
+                        
+                        # Validate the relocation URL makes sense
+                        if not self._validate_relocation_url(url, relocation_url):
+                            self.logger.warning(f"Relocation URL seems incorrect: {relocation_url}")
+                        
+                        self.driver.get(relocation_url)
                         self._simulate_human_behavior()
                         
                         # Wait for new page to load
-                        time.sleep(2)
+                        time.sleep(3)
+                        
+                        # Verify we're on the correct page
+                        current_url = self.driver.current_url
+                        page_title = self.driver.title
+                        self.logger.info(f"Navigated to: {current_url}")
+                        self.logger.info(f"Page title: {page_title}")
                         
                         # Extract content from relocated page
                         relocated_content = self._extract_main_content()
                         content_data['content_text'] = relocated_content
+                        
+                        # Validate content makes sense for the original guide
+                        if self._validate_relocated_content(url, relocated_content):
+                            self.logger.info(f"Successfully extracted relevant content from relocated page: {len(relocated_content)} characters")
+                        else:
+                            self.logger.warning(f"Relocated content may not be relevant to original guide")
                         
                         # Extract other content from relocated page
                         related_links = self._extract_related_links()
@@ -760,19 +760,17 @@ class ASICResourceScraper:
                         pdf_info = self._extract_pdf_content()
                         content_data.update(pdf_info)
                         
-                        self.logger.info(f"Successfully extracted content from relocated page: {len(relocated_content)} characters")
-                        
                     except Exception as nav_e:
-                        self.logger.error(f"Error navigating to relocated URL {new_url}: {nav_e}")
+                        self.logger.error(f"Error navigating to relocated URL {relocation_url}: {nav_e}")
                         # Fall back to extracting what we can from current page
-                        content_data['content_text'] = self._extract_main_content()
+                        content_data['content_text'] = original_content
                 else:
                     # No relocation link found, extract current page content
                     self.logger.warning(f"No relocation link found for withdrawn guide: {url}")
-                    content_data['content_text'] = self._extract_main_content()
+                    content_data['content_text'] = original_content
             else:
                 # Not withdrawn/relocated, extract normally
-                content_data['content_text'] = self._extract_main_content()
+                content_data['content_text'] = original_content
                 
                 # Extract related links
                 related_links = self._extract_related_links()
@@ -791,6 +789,150 @@ class ASICResourceScraper:
                 pass
         
         return content_data
+    
+    def _find_relocation_link(self, original_url: str) -> Optional[str]:
+        """Find the relocation link with improved detection"""
+        # Try very specific selectors first for known patterns
+        specific_selectors = [
+            # Look for the exact link from RG-154
+            "//a[@id='menur77m']",
+            "//a[contains(@href, 'certificates-issued-by-a-qualified-accountant')]",
+            "//a[contains(@title, 'Certificates issued by a qualified accountant')]",
+            "//a[contains(text(), 'Certificates issued by a qualified accountant')]",
+        ]
+        
+        # Try specific selectors first
+        for selector in specific_selectors:
+            try:
+                relocation_links = self.driver.find_elements(By.XPATH, selector)
+                for link in relocation_links:
+                    href = link.get_attribute('href')
+                    link_text = link.text.strip()
+                    link_id = link.get_attribute('id')
+                    link_title = link.get_attribute('title')
+                    
+                    self.logger.info(f"Found specific link - ID: '{link_id}', Text: '{link_text}', Title: '{link_title}', href: '{href}'")
+                    
+                    if href and href != original_url:
+                        # Make URL absolute if needed
+                        if not href.startswith('http'):
+                            href = urljoin(self.base_url, href)
+                        
+                        # For specific selectors, validate less strictly
+                        if self._is_specific_relocation_link(href, link_text, link_title):
+                            self.logger.info(f"Selected specific relocation link: {href}")
+                            return href
+                            
+            except Exception as e:
+                self.logger.warning(f"Error with specific selector {selector}: {e}")
+                continue
+        
+        # Fallback to general selectors
+        general_selectors = [
+            "//p[contains(text(), 'See now')]/a[1]",
+            "//a[contains(@href, '/regulatory-resources/financial-services/')]",
+            "//a[contains(@href, '/regulatory-resources/') and not(contains(@href, '/find-a-document/')) and not(contains(@href, '/consultation'))]",
+        ]
+        
+        for selector in general_selectors:
+            try:
+                relocation_links = self.driver.find_elements(By.XPATH, selector)
+                for link in relocation_links:
+                    href = link.get_attribute('href')
+                    link_text = link.text.strip()
+                    
+                    if href and href != original_url:
+                        # Make URL absolute if needed
+                        if not href.startswith('http'):
+                            href = urljoin(self.base_url, href)
+                        
+                        self.logger.info(f"Found general relocation link: {href} (text: '{link_text}')")
+                        
+                        # Validate this looks like a real relocation
+                        if self._is_valid_relocation_link(href, link_text):
+                            return href
+                            
+            except Exception as e:
+                self.logger.warning(f"Error with general selector {selector}: {e}")
+                continue
+        
+        return None
+    
+    def _is_specific_relocation_link(self, href: str, link_text: str, link_title: str) -> bool:
+        """Validate specific relocation links with less strict requirements"""
+        # Must be within ASIC domain
+        if not ('asic.gov.au' in href):
+            return False
+            
+        # Skip obviously wrong links
+        invalid_patterns = [
+            'javascript:',
+            'mailto:',
+            '#'
+        ]
+        
+        for pattern in invalid_patterns:
+            if pattern in href.lower():
+                return False
+        
+        # For specific links, we're more trusting
+        return True
+    
+    def _validate_relocated_content(self, original_url: str, content: str) -> bool:
+        """Validate if relocated content is relevant to the original guide"""
+        if not content or len(content) < 100:
+            return False
+        
+        # Extract document ID from original URL  
+        doc_id_match = re.search(r'rg-(\d+)', original_url.lower())
+        if doc_id_match:
+            doc_id = doc_id_match.group(1)
+            content_lower = content.lower()
+            
+            # For RG-154, content should be about certificates/qualified accountants
+            if doc_id == '154':
+                expected_topics = [
+                    'certificate', 
+                    'qualified accountant', 
+                    'accountant',
+                    'gross income',
+                    'net assets',
+                    '250,000',
+                    '2.5 million',
+                    'professional bodies',
+                    'disclosure document',
+                    'corporations act'
+                ]
+                
+                topic_matches = [topic for topic in expected_topics if topic in content_lower]
+                
+                # Red flags - content that suggests we're on the wrong page
+                wrong_topics = [
+                    'legislative instrument', 
+                    'consultation', 
+                    'sunset', 
+                    'remake',
+                    'comments close',
+                    'seeking feedback',
+                    'proposal to remake'
+                ]
+                
+                wrong_matches = [topic for topic in wrong_topics if topic in content_lower]
+                
+                if wrong_matches:
+                    self.logger.error(f"Content contains wrong topics for RG-154: {wrong_matches}")
+                    self.logger.error(f"Content preview: {content[:500]}...")
+                    return False
+                
+                if topic_matches:
+                    self.logger.info(f"Content contains expected topics for RG-154: {topic_matches}")
+                    return True
+                else:
+                    self.logger.warning(f"Content does not contain expected topics for RG-154")
+                    self.logger.warning(f"Content preview: {content[:500]}...")
+                    return False
+        
+        return True  # Default to allowing it
     
     def _scrape_information_sheet(self, url: str) -> Dict:
         """Scrape information sheet content with accordion extraction"""
@@ -918,8 +1060,13 @@ class ASICResourceScraper:
         """Scrape instrument content from legislation.gov.au"""
         content_data = {
             'content_text': '',
+            'legislative_instrument_content': '',
+            'explanatory_statement_content': '',
+            'combined_iframe_content': '',
             'pdf_content': '',
-            'pdf_checksum': None
+            'pdf_checksum': None,
+            'is_legislation_gov_au': False,
+            'document_types_extracted': []
         }
         
         try:
@@ -928,19 +1075,374 @@ class ASICResourceScraper:
                 content_data['content_text'] = self._extract_main_content()
                 return content_data
             
-            # Extract main HTML content
+            content_data['is_legislation_gov_au'] = True
+            self.logger.info(f"Processing legislation.gov.au instrument: {url}")
+            
+            # Extract main HTML content (navigation/header)
             content_data['content_text'] = self._extract_main_content()
             
-            # Look for PDF iframe and extract PDF content
-            pdf_content = self._extract_legislation_pdf()
-            if pdf_content:
-                content_data['pdf_content'] = pdf_content
-                content_data['pdf_checksum'] = hashlib.md5(pdf_content.encode()).hexdigest()
+            # Extract iframe content (both document types)
+            iframe_content = self._extract_legislation_iframe_content()
+            if iframe_content:
+                content_data['combined_iframe_content'] = iframe_content
+                
+                # Split combined content into parts
+                parts = self._split_instrument_content(iframe_content)
+                content_data['legislative_instrument_content'] = parts.get('legislative_instrument', '')
+                content_data['explanatory_statement_content'] = parts.get('explanatory_statement', '')
+                content_data['document_types_extracted'] = list(parts.keys())
+                
+                self.logger.info(f"Extracted {len(parts)} document types from instrument")
+            
+            # Fallback: try PDF download if iframe extraction failed
+            if not iframe_content:
+                self.logger.info("Iframe extraction failed, trying PDF download fallback")
+                pdf_content = self._extract_instrument_pdf_fallback()
+                if pdf_content:
+                    content_data['pdf_content'] = pdf_content
+                    content_data['pdf_checksum'] = hashlib.md5(pdf_content.encode()).hexdigest()
             
         except Exception as e:
             self.logger.error(f"Error scraping instrument {url}: {e}")
         
         return content_data
+    
+    def _extract_legislation_iframe_content(self) -> str:
+        """Extract content from legislation.gov.au iframe - both Legislative instrument and Explanatory statement"""
+        try:
+            all_content = {}
+            
+            # Document types to extract
+            content_types = [
+                ("Legislative instrument", "legislative_instrument"),
+                ("Explanatory statement", "explanatory_statement")
+            ]
+            
+            for display_name, content_key in content_types:
+                self.logger.info(f"Extracting {display_name} content...")
+                
+                # Select the document type from dropdown
+                if self._select_instrument_document_type(display_name):
+                    # Extract content for this document type
+                    content = self._extract_iframe_content()
+                    if content:
+                        all_content[content_key] = content
+                        self.logger.info(f"Successfully extracted {len(content)} characters for {display_name}")
+                    else:
+                        self.logger.warning(f"No content found for {display_name}")
+                else:
+                    self.logger.warning(f"Could not select {display_name} from dropdown")
+            
+            # Combine all content
+            if all_content:
+                combined_content = ""
+                for content_type, content in all_content.items():
+                    combined_content += f"\n\n=== {content_type.replace('_', ' ').title()} ===\n\n"
+                    combined_content += content
+                
+                self.logger.info(f"Combined content from {len(all_content)} document types: {len(combined_content)} total characters")
+                return combined_content
+            
+            # Fallback: try to get any iframe content without switching
+            self.logger.info("Fallback: extracting current iframe content without dropdown selection")
+            iframe_content = self._extract_iframe_content()
+            return iframe_content or ""
+            
+        except Exception as e:
+            self.logger.warning(f"Error extracting legislation iframe content: {e}")
+            return ""
+    
+    def _select_instrument_document_type(self, target_type: str) -> bool:
+        """Select document type from dropdown (Legislative instrument or Explanatory statement)"""
+        try:
+            self.logger.info(f"Attempting to select '{target_type}' from dropdown")
+            
+            # Find and click the dropdown toggle button
+            dropdown_selectors = [
+                "button#FRL_COMPONENT_Select",
+                "button[id*='FRL_COMPONENT']",
+                "button.dropdown-toggle",
+                "[ngbdropdowntoggle]"
+            ]
+            
+            dropdown_button = None
+            for selector in dropdown_selectors:
+                try:
+                    buttons = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for button in buttons:
+                        # Check if this looks like the document type dropdown
+                        aria_describedby = button.get_attribute('aria-describedby') or ''
+                        button_id = button.get_attribute('id') or ''
+                        
+                        if 'FRL_COMPONENT' in aria_describedby + button_id:
+                            dropdown_button = button
+                            self.logger.info(f"Found dropdown button: {button_id}")
+                            break
+                    if dropdown_button:
+                        break
+                except:
+                    continue
+            
+            if not dropdown_button:
+                self.logger.warning("Could not find dropdown button")
+                return False
+            
+            # Check if dropdown is already expanded
+            is_expanded = dropdown_button.get_attribute('aria-expanded') == 'true'
+            
+            if not is_expanded:
+                # Click to open dropdown
+                self.logger.info("Opening dropdown menu")
+                self.driver.execute_script("arguments[0].click();", dropdown_button)
+                time.sleep(1)
+            
+            # Find and click the target option
+            option_selectors = [
+                "button.dropdown-item",
+                "[ngbdropdownitem]",
+                ".dropdown-menu button"
+            ]
+            
+            target_selected = False
+            for selector in option_selectors:
+                try:
+                    options = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for option in options:
+                        option_text = option.text.strip()
+                        self.logger.info(f"Found dropdown option: '{option_text}'")
+                        
+                        if target_type.lower() in option_text.lower():
+                            self.logger.info(f"Clicking option: '{option_text}'")
+                            self.driver.execute_script("arguments[0].click();", option)
+                            time.sleep(2)  # Wait for content to load
+                            target_selected = True
+                            break
+                    
+                    if target_selected:
+                        break
+                except Exception as e:
+                    self.logger.warning(f"Error with option selector {selector}: {e}")
+                    continue
+            
+            if target_selected:
+                self.logger.info(f"Successfully selected '{target_type}'")
+                return True
+            else:
+                self.logger.warning(f"Could not find option for '{target_type}'")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error selecting document type '{target_type}': {e}")
+            return False
+    
+    def _extract_iframe_content(self) -> str:
+        """Extract content from iframe (handles blob URLs)"""
+        try:
+            # Look for the main content iframe
+            iframe_selectors = [
+                "iframe#epubFrame",
+                "iframe[name='epubFrame']", 
+                "iframe[title*='Document']",
+                "iframe[src*='blob:']",
+                "iframe"
+            ]
+            
+            iframe_element = None
+            for selector in iframe_selectors:
+                try:
+                    iframes = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for iframe in iframes:
+                        # Check if this looks like a content iframe
+                        iframe_id = iframe.get_attribute('id')
+                        iframe_name = iframe.get_attribute('name') 
+                        iframe_title = iframe.get_attribute('title')
+                        
+                        # Prioritize content iframes
+                        if any(indicator in str(iframe_id).lower() + str(iframe_name).lower() + str(iframe_title).lower() 
+                               for indicator in ['epub', 'document', 'content', 'text']):
+                            iframe_element = iframe
+                            self.logger.info(f"Selected content iframe: {iframe_id or iframe_name}")
+                            break
+                    
+                    if iframe_element:
+                        break
+                except:
+                    continue
+            
+            if not iframe_element:
+                self.logger.warning("No content iframe found")
+                return ""
+            
+            # Switch to iframe and extract content
+            self.logger.info("Switching to iframe to extract content")
+            self.driver.switch_to.frame(iframe_element)
+            
+            # Wait a moment for iframe content to load
+            time.sleep(2)
+            
+            # Try to extract text from iframe
+            iframe_content = ""
+            
+            # Try multiple strategies to get iframe content
+            content_strategies = [
+                # Strategy 1: Look for main content containers
+                lambda: self._extract_from_iframe_selectors([
+                    "main", "article", ".content", "#content", 
+                    ".document-content", ".legislation-content", 
+                    ".text-content", "body"
+                ]),
+                
+                # Strategy 2: Get all visible text
+                lambda: self.driver.find_element(By.TAG_NAME, "body").text.strip(),
+                
+                # Strategy 3: Get page source and parse
+                lambda: self._extract_text_from_html_source(self.driver.page_source)
+            ]
+            
+            for i, strategy in enumerate(content_strategies):
+                try:
+                    self.logger.info(f"Trying iframe content extraction strategy {i+1}")
+                    content = strategy()
+                    if content and len(content) > 200:  # Substantial content
+                        iframe_content = content
+                        self.logger.info(f"Strategy {i+1} successful: extracted {len(content)} characters")
+                        break
+                except Exception as e:
+                    self.logger.warning(f"Strategy {i+1} failed: {e}")
+                    continue
+            
+            # Switch back to main content
+            self.driver.switch_to.default_content()
+            
+            if iframe_content:
+                return self._clean_text(iframe_content)
+            else:
+                self.logger.warning("No substantial content found in iframe")
+                return ""
+                
+        except Exception as e:
+            # Make sure we switch back to main content
+            try:
+                self.driver.switch_to.default_content()
+            except:
+                pass
+            self.logger.error(f"Error extracting iframe content: {e}")
+            return ""
+    
+    def _extract_from_iframe_selectors(self, selectors: list) -> str:
+        """Try to extract content using multiple selectors within iframe"""
+        for selector in selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    content = elements[0].text.strip()
+                    if len(content) > 200:  # Substantial content
+                        self.logger.info(f"Found iframe content using selector: {selector}")
+                        return content
+            except:
+                continue
+        return ""
+    
+    def _extract_text_from_html_source(self, html_source: str) -> str:
+        """Extract text from HTML source using basic parsing"""
+        try:
+            # Remove script and style elements
+            html_source = re.sub(r'<script[^>]*>.*?</script>', '', html_source, flags=re.DOTALL | re.IGNORECASE)
+            html_source = re.sub(r'<style[^>]*>.*?</style>', '', html_source, flags=re.DOTALL | re.IGNORECASE)
+            
+            # Remove HTML tags
+            text = re.sub(r'<[^>]+>', ' ', html_source)
+            
+            # Clean up whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+            
+            return text
+        except Exception as e:
+            self.logger.warning(f"Error extracting text from HTML: {e}")
+            return ""
+    
+    def _extract_instrument_pdf_fallback(self) -> str:
+        """Fallback method to extract PDF content if iframe extraction fails"""
+        try:
+            # Try to construct PDF URL from current page URL
+            current_url = self.driver.current_url
+            if '/latest/text' in current_url:
+                pdf_url = current_url.replace('/latest/text', '/latest/text.pdf')
+                self.logger.info(f"Trying constructed PDF URL: {pdf_url}")
+                
+                # Test if PDF URL is accessible and download
+                try:
+                    response = self.session.head(pdf_url, timeout=10)
+                    if response.status_code == 200:
+                        self.logger.info(f"Constructed PDF URL is accessible")
+                        return self._download_and_extract_pdf(pdf_url)
+                except:
+                    pass
+            
+            # Look for PDF download buttons
+            pdf_button_selectors = [
+                "button[title*='Download PDF']",
+                "button.btn-pdf-volume-download",
+                ".btn-circle[title*='PDF']",
+                "a[href*='.pdf']"
+            ]
+            
+            for selector in pdf_button_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        href = element.get_attribute('href')
+                        if href and '.pdf' in href:
+                            self.logger.info(f"Found PDF download link: {href}")
+                            return self._download_and_extract_pdf(href)
+                except:
+                    continue
+            
+            self.logger.warning("No PDF fallback method worked")
+            return ""
+            
+        except Exception as e:
+            self.logger.warning(f"Error in PDF fallback extraction: {e}")
+            return ""
+    
+    def _split_instrument_content(self, combined_content: str) -> dict:
+        """Split combined content back into parts"""
+        parts = {}
+        
+        try:
+            # Look for section markers
+            legislative_marker = "=== Legislative Instrument ==="
+            explanatory_marker = "=== Explanatory Statement ==="
+            
+            if legislative_marker in combined_content:
+                sections = combined_content.split(legislative_marker)
+                if len(sections) > 1:
+                    legislative_section = sections[1]
+                    
+                    if explanatory_marker in legislative_section:
+                        leg_parts = legislative_section.split(explanatory_marker)
+                        parts['legislative_instrument'] = leg_parts[0].strip()
+                        if len(leg_parts) > 1:
+                            parts['explanatory_statement'] = leg_parts[1].strip()
+                    else:
+                        parts['legislative_instrument'] = legislative_section.strip()
+            
+            elif explanatory_marker in combined_content:
+                sections = combined_content.split(explanatory_marker)
+                if len(sections) > 1:
+                    parts['explanatory_statement'] = sections[1].strip()
+            
+            # If no markers found, treat entire content as legislative instrument
+            if not parts and combined_content.strip():
+                parts['legislative_instrument'] = combined_content.strip()
+            
+        except Exception as e:
+            self.logger.warning(f"Error splitting combined content: {e}")
+            # Fallback: return entire content as legislative instrument
+            if combined_content.strip():
+                parts['legislative_instrument'] = combined_content.strip()
+        
+        return parts
     
     def _extract_main_content(self) -> str:
         """Extract main text content from page"""
