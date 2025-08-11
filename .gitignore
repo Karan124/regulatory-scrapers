@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtualenvs
+.env
+venv/
+env/
+venv*/
+
+# Data folders (ignore contents but keep .gitkeep)
+**/data/*
+!**/data/.gitkeep
+
+# Editor/OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Secrets
+*.key
+*.pem
+
+# Others
+*.deb*
