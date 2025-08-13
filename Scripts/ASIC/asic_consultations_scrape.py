@@ -61,13 +61,16 @@ except ImportError as e:
 class ASICResourceScraper:
     """Main scraper class for ASIC regulatory resources"""
     
-    def __init__(self, max_pages: int = None, data_dir: str = "data"):
+    def __init__(self, max_pages: 2 = None, data_dir: str = "data"):
         self.base_url = "https://www.asic.gov.au"
         self.search_url = f"{self.base_url}/regulatory-resources/regulatory-resources-search/"
-        self.max_pages = max_pages  # None for full scrape, integer for limited pages
+        
+        # Pagination control - can be set for different run types
+        self.MAX_PAGE = max_pages  # None for full scrape, integer for limited pages
+        
         self.data_dir = Path(data_dir)
         self.output_file = self.data_dir / "asic_regulatory_resources.json"
-        self.log_file = self.data_dir / "asic_resources_scraper.log"
+        self.log_file = self.data_dir / "asic_scraper.log"
         
         # Create data directory
         self.data_dir.mkdir(exist_ok=True)
@@ -2055,7 +2058,7 @@ def main():
         max_pages = args.max_pages
     
     # Initialize and run scraper
-    scraper = ASICResourceScraper(max_pages=max_pages, data_dir=args.data_dir)
+    scraper = ASICResourceScraper(max_pages=2, data_dir=args.data_dir)
     
     try:
         scraper._init_driver()  # Initialize driver first
