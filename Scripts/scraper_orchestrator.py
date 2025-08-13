@@ -655,7 +655,7 @@ DETAILED RESULTS:
             ("ACCC", "ACCC", None, 300, "standard"),
             ("ASIC Media", "ASIC", ["asic_media_releases_scrape.py"], 480, "complex"),
             ("ASIC News", "ASIC", ["asic_news_scrape.py"], 480, "complex"),
-            ("ASIC Consultations", "ASIC", ["asic_consultations_scrape.py"], 900, "heavy"),  # JavaScript + PDF
+            ("ASIC Consultations", "ASIC", ["asic_consultations_scrape.py"], 1500, "giant"),  # JavaScript + PDF
             ("APRA News", "APRA", ["apra_news_scrape.py"], 300, "standard"),
             ("APRA Info Papers", "APRA", ["apra_info_papers_scrape.py"], 900, "heavy"),
             ("APRA Statistical Publications", "APRA", ["apra_statistical_publications_scrape.py"], 900, "heavy"),
