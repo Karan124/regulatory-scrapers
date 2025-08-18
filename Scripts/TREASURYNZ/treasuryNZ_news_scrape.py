@@ -60,7 +60,7 @@ except ImportError:
 class TreasuryNZNewsScraper:
     """Main scraper class for Treasury NZ news articles"""
     
-    def __init__(self, max_pages=None):
+    def __init__(self, max_pages=1):
         self.base_url = "https://www.treasury.govt.nz"
         self.news_url = "https://www.treasury.govt.nz/news-and-events/news"
         

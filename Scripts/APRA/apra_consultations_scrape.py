@@ -3,6 +3,7 @@
 APRA Consultations Web Scraper
 Scrapes consultation data from APRA website across multiple industries
 with anti-bot measures, PDF processing, and deduplication support.
+Modified for batch mode execution without user input.
 """
 
 import json
@@ -15,7 +16,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
-import hashlib
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,7 +43,13 @@ logger = logging.getLogger(__name__)
 class APRAConsultationScraper:
     """Main scraper class for APRA consultations"""
     
-    def __init__(self):
+    def __init__(self, force_fresh_scrape=False):
+        """
+        Initialize scraper
+        
+        Args:
+            force_fresh_scrape (bool): If True, ignores previously seen URLs and scrapes everything fresh
+        """
         self.base_url = "https://www.apra.gov.au"
         self.consultation_urls = {
             "Authorised deposit-taking institutions": "https://www.apra.gov.au/consultations/1",
@@ -58,7 +64,13 @@ class APRAConsultationScraper:
         
         # Load existing data for deduplication
         self.existing_consultations = self._load_existing_data()
-        self.seen_urls = self._load_seen_urls()
+        
+        # Handle fresh scrape mode
+        if force_fresh_scrape:
+            self.seen_urls = set()
+            logger.info("Force fresh scrape enabled - ignoring previously seen URLs")
+        else:
+            self.seen_urls = self._load_seen_urls()
         
         # Setup session with realistic headers
         self.session = requests.Session()
@@ -729,19 +741,27 @@ class APRAConsultationScraper:
             self.driver.quit()
 
 def main():
-    """Main execution function"""
-    scraper = APRAConsultationScraper()
+    """Main execution function - batch mode compatible"""
+    # Default to incremental scraping (uses seen URLs to avoid duplicates)
+    # Set force_fresh_scrape=True to ignore previously seen URLs and scrape everything
+    force_fresh_scrape = False
+    
+    # Check for command line argument to force fresh scrape
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ['--fresh', '-f', '--force-fresh']:
+        force_fresh_scrape = True
+        logger.info("Fresh scrape mode enabled via command line argument")
+    
+    scraper = APRAConsultationScraper(force_fresh_scrape=force_fresh_scrape)
     
     try:
-        logger.info("Starting APRA consultation scraping...")
+        logger.info("Starting APRA consultation scraping in batch mode...")
         
-        # For fresh scrape, optionally clear seen URLs
-        if len(scraper.seen_urls) > 0:
-            logger.info(f"Found {len(scraper.seen_urls)} previously seen URLs")
-            user_input = input("Do you want to perform a fresh scrape (clear seen URLs)? (y/n): ").lower().strip()
-            if user_input == 'y':
-                scraper.seen_urls.clear()
-                logger.info("Cleared seen URLs for fresh scrape")
+        # Log scraping mode
+        if force_fresh_scrape:
+            logger.info("Running in FRESH SCRAPE mode - ignoring previously seen URLs")
+        else:
+            logger.info(f"Running in INCREMENTAL mode - found {len(scraper.seen_urls)} previously seen URLs")
         
         consultations = scraper.scrape_all_consultations()
         scraper.save_results(consultations)
@@ -750,6 +770,11 @@ def main():
         total_consultations = sum(len(industry_consultations) for industry_consultations in consultations.values())
         logger.info(f"Scraping completed. Total new consultations: {total_consultations}")
         
+        # Log detailed summary by industry
+        for industry, industry_consultations in consultations.items():
+            if industry_consultations:
+                logger.info(f"  {industry}: {len(industry_consultations)} new consultations")
+        
         # Log status breakdown for debugging
         status_counts = {}
         for industry, industry_consultations in consultations.items():
@@ -757,10 +782,19 @@ def main():
                 status = consultation.get('status', 'Unknown')
                 status_counts[status] = status_counts.get(status, 0) + 1
         
-        logger.info(f"Status breakdown: {status_counts}")
+        if status_counts:
+            logger.info(f"Status breakdown: {status_counts}")
+        else:
+            logger.info("No new consultations found")
+        
+        # Log completion time
+        logger.info(f"Batch scraping completed successfully at {datetime.now().isoformat()}")
         
     except Exception as e:
         logger.error(f"Scraping failed: {e}")
+        # Exit with error code for batch processing
+        import sys
+        sys.exit(1)
         
     finally:
         scraper.cleanup()
