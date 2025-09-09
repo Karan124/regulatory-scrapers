@@ -1,0 +1,74 @@
+{
+  "performance_metrics": {
+    "total_runtime_seconds": 5687.63,
+    "items_per_second": 0.13,
+    "scraper_version": "5.0.0",
+    "configuration": {
+      "max_pages": 10,
+      "max_workers": 4,
+      "incremental_mode": true,
+      "page_timeout": 10
+    }
+  },
+  "run_summary": {
+    "scrape_timestamp": "2025-09-09T11:41:10.011791",
+    "new_items_processed": 747,
+    "items_skipped": 0,
+    "errors_encountered": 3,
+    "success_rate": 99.6
+  },
+  "performance_counters": {
+    "counters": {
+      "items_found": 750,
+      "items_skipped_duplicate in Legislative Instruments": 135,
+      "items_skipped_duplicate in Notifiable Instruments": 94,
+      "items_skipped_duplicate in Acts": 21,
+      "items_processed": 747,
+      "extraction_failures": 3
+    },
+    "active_timers": [
+      "driver_setup",
+      "list_scraping",
+      "page_1",
+      "page_2",
+      "page_3",
+      "page_4",
+      "page_5",
+      "page_6",
+      "page_7",
+      "page_8",
+      "page_9",
+      "page_10",
+      "content_extraction"
+    ]
+  },
+  "summary_by_type": {
+    "Legislative Instruments": {
+      "new_items": 716,
+      "avg_content_length": 76037,
+      "total_content_chars": 54442873,
+      "date_range": {
+        "earliest": "2022-09-20",
+        "latest": "2025-09-09"
+      }
+    },
+    "Acts": {
+      "new_items": 24,
+      "avg_content_length": 349076,
+      "total_content_chars": 8377836,
+      "date_range": {
+        "earliest": "2025-05-01",
+        "latest": "2025-09-06"
+      }
+    },
+    "Notifiable Instruments": {
+      "new_items": 7,
+      "avg_content_length": 633996,
+      "total_content_chars": 4437976,
+      "date_range": {
+        "earliest": "2025-06-10",
+        "latest": "2025-09-06"
+      }
+    }
+  }
+}

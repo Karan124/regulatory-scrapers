@@ -98,6 +98,46 @@ def extract_pdf_content(pdf_url, session):
         logging.error(f"Failed to process PDF {pdf_url} with pdfplumber: {e}", exc_info=True)
         return None
 
+def find_published_date(content_area):
+    """Try multiple strategies to find the published date."""
+    # Strategy 1: Original selector
+    date_element = content_area.find('div', class_='mb-0 text-base')
+    if date_element:
+        return clean_text(date_element.text)
+    
+    # Strategy 2: Look for other common date classes
+    date_selectors = [
+        {'class_': 'text-base'},
+        {'class_': 'date'},
+        {'class_': 'published'},
+        {'class_': 'publish-date'},
+        {'class_': 'article-date'},
+        {'class_': re.compile(r'.*date.*', re.IGNORECASE)},
+        {'class_': re.compile(r'.*publish.*', re.IGNORECASE)}
+    ]
+    
+    for selector in date_selectors:
+        date_element = content_area.find('div', selector)
+        if date_element:
+            return clean_text(date_element.text)
+    
+    # Strategy 3: Look for date patterns in any text
+    all_text = content_area.get_text()
+    date_patterns = [
+        r'\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}',
+        r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}',
+        r'\d{1,2}/\d{1,2}/\d{4}',
+        r'\d{4}-\d{2}-\d{2}'
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, all_text, re.IGNORECASE)
+        if match:
+            return match.group()
+    
+    logging.warning("Could not find published date using any strategy")
+    return "Date not found"
+
 # --- Scraping Logic ---
 
 def scrape_article_page(article_url, session):
@@ -107,29 +147,63 @@ def scrape_article_page(article_url, session):
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        title = clean_text(soup.find('h1', class_='page-title').text)
+        # Extract title with fallback
+        title_element = soup.find('h1', class_='page-title')
+        if not title_element:
+            title_element = soup.find('h1')  # Fallback to any h1
+        if not title_element:
+            logging.warning(f"Could not find title for {article_url}")
+            return None
+        title = clean_text(title_element.text)
+        
+        # Find content area with fallback
         content_area = soup.find('div', class_='node__content')
+        if not content_area:
+            content_area = soup.find('div', class_='content')  # Fallback
+        if not content_area:
+            content_area = soup.find('main')  # Another fallback
         if not content_area:
             logging.warning(f"Could not find main content area for {article_url}")
             return None
             
-        published_date = clean_text(content_area.find('div', class_='mb-0 text-base').text)
+        # Extract published date - simple null check
+        date_element = content_area.find('div', class_='mb-0 text-base')
+        if date_element:
+            published_date = clean_text(date_element.text)
+        else:
+            logging.warning(f"Date element 'mb-0 text-base' not found for {article_url}")
+            published_date = "Date not found"
+        
+        # Extract image with fallback
         image_tag = content_area.find('img')
-        image_url = f"{BASE_URL}{image_tag['src']}" if image_tag and image_tag.get('src', '').startswith('/') else image_tag.get('src', "N/A")
+        image_url = "N/A"
+        if image_tag and image_tag.get('src'):
+            src = image_tag['src']
+            image_url = f"{BASE_URL}{src}" if src.startswith('/') else src
 
+        # Find main text area with fallbacks
         main_text_area = content_area.find('div', class_='field--name-body')
         if not main_text_area:
-            logging.warning(f"Main text area 'field--name-body' not found in {article_url}")
+            main_text_area = content_area.find('div', class_='body')
+        if not main_text_area:
+            main_text_area = content_area.find('div', class_='content-body')
+        if not main_text_area:
+            # Last resort: use the entire content area
+            main_text_area = content_area
+            logging.info(f"Using entire content area as fallback for main text in {article_url}")
+
+        if not main_text_area:
+            logging.warning(f"Main text area not found in {article_url}")
             return None
 
-        # *** NEW LOGIC: ALWAYS capture web content ***
+        # *** ALWAYS capture web content ***
         web_content = clean_text(main_text_area.get_text(separator='\n', strip=True))
         logging.info(f"Extracted web content for: {title}")
 
-        # *** NEW LOGIC: ALSO capture PDF content if available ***
+        # *** ALSO capture PDF content if available ***
         pdf_content = None
         pdf_link_tag = main_text_area.find('a', href=re.compile(r'\.pdf$', re.IGNORECASE))
-        if pdf_link_tag:
+        if pdf_link_tag and pdf_link_tag.get('href'):
             logging.info("PDF link found, extracting PDF content as well.")
             pdf_url = pdf_link_tag['href']
             if not pdf_url.startswith('http'):
@@ -186,10 +260,12 @@ def main():
                 break
 
             for link in article_links:
-                if not link.has_attr('href'): continue
+                if not link.has_attr('href'): 
+                    continue
                 
                 article_url = f"{BASE_URL}{link['href']}"
-                if article_url in processed_urls: continue
+                if article_url in processed_urls: 
+                    continue
 
                 article_data = scrape_article_page(article_url, session)
                 if article_data:

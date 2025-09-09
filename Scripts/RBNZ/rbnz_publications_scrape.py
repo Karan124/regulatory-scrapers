@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-RBNZ Publications Scraper
+RBNZ Publications Scraper - Fixed with Proper Logging
 Scrapes all publications from the Reserve Bank of New Zealand publications library
-with working pagination.
+with working pagination and proper status logging.
 """
 
 import json
@@ -40,7 +40,7 @@ CONFIG = {
     'RATE_LIMIT': 292,  # requests per hour
     'REQUEST_DELAY': 3600 / 292,  # seconds between requests (~12.3 seconds)
     'SAFETY_MARGIN': 0.8,  # Use only 80% of allowed rate for safety
-    'MAX_PAGE': 2,  # Set to None for full scrape, or integer for limited pages
+    'MAX_PAGE': 1,  # Set to None for full scrape, or integer for limited pages
     'OUTPUT_DIR': './data',
     'OUTPUT_FILE': './data/rbnz_publications.json',
     'LOG_FILE': './publications_scrape.log',
@@ -231,9 +231,9 @@ class RBNZPublicationsScraper:
     def _extract_pdf_text(self, pdf_url: str) -> str:
         """Extract text from PDF files"""
         try:
-            self._rate_limit()
-            response = self.session.get(pdf_url, timeout=60)
-            response.raise_for_status()
+            response = self._safe_request(pdf_url, timeout=60)
+            if not response:
+                return ""
             
             pdf_reader = PyPDF2.PdfReader(BytesIO(response.content))
             text_content = []
@@ -410,9 +410,9 @@ class RBNZPublicationsScraper:
     def _extract_excel_data(self, excel_url: str) -> str:
         """Extract data from Excel files using SheetJS"""
         try:
-            self._rate_limit()
-            response = self.session.get(excel_url, timeout=60)
-            response.raise_for_status()
+            response = self._safe_request(excel_url, timeout=60)
+            if not response:
+                return ""
             
             # Try to use openpyxl if available, otherwise skip Excel processing
             try:
@@ -448,14 +448,15 @@ class RBNZPublicationsScraper:
             return ""
 
     def _extract_publication_content(self, publication_url: str) -> Optional[Dict]:
-        """Extract content from a single publication"""
+        """Extract content from a single publication with proper status handling"""
         if publication_url in self.scraped_urls:
-            return None
+            self.logger.debug(f"Skipping already scraped publication: {publication_url}")
+            return "ALREADY_SCRAPED"  # Return special marker instead of None
             
         try:
-            self._rate_limit()
-            response = self.session.get(publication_url, timeout=30)
-            response.raise_for_status()
+            response = self._safe_request(publication_url, timeout=30)
+            if not response:
+                return None
             
             soup = BeautifulSoup(response.content, 'html.parser')
             
@@ -685,7 +686,7 @@ class RBNZPublicationsScraper:
             return None
 
     def scrape_all_publications(self) -> List[Dict]:
-        """Main scraping method with progress tracking"""
+        """Main scraping method with improved logging"""
         self.logger.info(f"Starting RBNZ publications scraping (max_pages: {self.max_pages})")
         
         # Get all publication URLs
@@ -709,13 +710,18 @@ class RBNZPublicationsScraper:
         
         # Extract content from each publication
         publications = []
-        failed_urls = []
+        already_scraped_count = 0
+        failed_count = 0
         
         for i, url in enumerate(publication_urls, 1):
             self.logger.info(f"Processing publication {i}/{len(publication_urls)}: {url}")
             
             publication_data = self._extract_publication_content(url)
-            if publication_data:
+            
+            if publication_data == "ALREADY_SCRAPED":
+                already_scraped_count += 1
+                self.logger.info(f"↻ Already scraped: {url}")
+            elif publication_data:
                 publications.append(publication_data)
                 self.logger.info(f"✓ Scraped: {publication_data['title'][:60]}...")
                 
@@ -723,21 +729,18 @@ class RBNZPublicationsScraper:
                 if len(publications) % 10 == 0:
                     self._save_progress(publications)
                     self.logger.info(f"Progress saved: {len(publications)} publications scraped")
-                    
             else:
-                failed_urls.append(url)
+                failed_count += 1
                 self.logger.warning(f"✗ Failed to scrape: {url}")
         
         # Final save
         self._save_progress(publications)
         
-        if failed_urls:
-            self.logger.warning(f"Failed to scrape {len(failed_urls)} publications")
-            # Save failed URLs for potential retry
-            with open('./data/failed_publications.json', 'w') as f:
-                json.dump(failed_urls, f, indent=2)
+        if failed_count > 0:
+            self.logger.warning(f"Failed to scrape {failed_count} publications")
+            # Note: failed_urls tracking removed since we now have proper status handling
                 
-        self.logger.info(f"Scraping completed. Total publications: {len(publications)}")
+        self.logger.info(f"Scraping completed. New: {len(publications)}, Already scraped: {already_scraped_count}, Failed: {failed_count}")
         return publications
 
     def _save_progress(self, publications: List[Dict]):
@@ -807,7 +810,7 @@ class RBNZPublicationsScraper:
             if publications:
                 self.save_results(publications)
             else:
-                self.logger.warning("No publications were scraped")
+                self.logger.warning("No new publications were scraped")
                 
         except Exception as e:
             self.logger.error(f"Scraping failed: {e}")
@@ -822,7 +825,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='RBNZ Publications Scraper')
-    parser.add_argument('--max-pages', type=int, default=2,
+    parser.add_argument('--max-pages', type=int, default=1,
                        help='Maximum number of pages to scrape')
     parser.add_argument('--max-publications', type=int, default=None,
                        help='Maximum number of publications to scrape (useful for testing)')
@@ -845,7 +848,9 @@ def main():
     if args.test_url:
         scraper = RBNZPublicationsScraper(use_selenium=args.use_selenium)
         result = scraper._extract_publication_content(args.test_url)
-        if result:
+        if result == "ALREADY_SCRAPED":
+            print(f"↻ Publication already scraped: {args.test_url}")
+        elif result:
             print(f"✓ Successfully scraped: {result['title']}")
             print(f"  Date: {result['published_date']}")
             print(f"  Type: {result['publication_type']}")

@@ -28,7 +28,7 @@ import pandas as pd
 BASE_URL = "https://www.rba.gov.au"
 NEWS_URL = f"{BASE_URL}/news/"
 DATA_FOLDER = "data"
-MAX_PAGES = 7  # Set to high number for full scrape, set to 3 for daily runs
+MAX_PAGES = 2  # Set to high number for full scrape, set to 3 for daily runs
 LOG_FILE = f"{DATA_FOLDER}/rba_scraper.log"
 JSON_FILE = f"{DATA_FOLDER}/rba_all_news.json"
 CSV_FILE = f"{DATA_FOLDER}/rba_all_news.csv"

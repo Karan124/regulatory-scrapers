@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-RBNZ News Scraper - Simplified and Fixed
+RBNZ News Scraper - Fixed with Proper Logging
 Scrapes all news articles from the Reserve Bank of New Zealand website
-with working pagination.
+with working pagination and proper status logging.
 """
 
 import json
@@ -39,7 +39,7 @@ CONFIG = {
     'USER_AGENT': 'rbnz-approved-agent/rg-11701',
     'RATE_LIMIT': 292,  # requests per hour
     'REQUEST_DELAY': 3600 / 292,  # seconds between requests
-    'MAX_PAGE': 2,  # Set to None for full scrape, or integer for limited pages
+    'MAX_PAGE': 1,  # Set to None for full scrape, or integer for limited pages
     'OUTPUT_DIR': './data',
     'OUTPUT_FILE': './data/rbnz_news.json',
     'LOG_FILE': './scrape.log',
@@ -260,9 +260,10 @@ class RBNZScraper:
             return []
 
     def _extract_article_content(self, article_url: str) -> Optional[Dict]:
-        """Extract content from a single article"""
+        """Extract content from a single article with proper status handling"""
         if article_url in self.scraped_urls:
-            return None
+            self.logger.debug(f"Skipping already scraped article: {article_url}")
+            return "ALREADY_SCRAPED"  # Return special marker instead of None
             
         try:
             self._rate_limit()
@@ -376,7 +377,7 @@ class RBNZScraper:
             return None
 
     def scrape_all_articles(self) -> List[Dict]:
-        """Main scraping method"""
+        """Main scraping method with improved logging"""
         self.logger.info(f"Starting RBNZ news scraping (max_pages: {self.max_pages})")
         
         # Get all article URLs
@@ -395,17 +396,25 @@ class RBNZScraper:
         
         # Extract content from each article
         articles = []
+        already_scraped_count = 0
+        failed_count = 0
+        
         for i, url in enumerate(article_urls, 1):
             self.logger.info(f"Processing article {i}/{len(article_urls)}: {url}")
             
             article_data = self._extract_article_content(url)
-            if article_data:
+            
+            if article_data == "ALREADY_SCRAPED":
+                already_scraped_count += 1
+                self.logger.info(f"↻ Already scraped: {url}")
+            elif article_data:
                 articles.append(article_data)
                 self.logger.info(f"✓ Scraped: {article_data['headline'][:60]}...")
             else:
+                failed_count += 1
                 self.logger.warning(f"✗ Failed to scrape: {url}")
                 
-        self.logger.info(f"Scraping completed. Total articles: {len(articles)}")
+        self.logger.info(f"Scraping completed. New: {len(articles)}, Already scraped: {already_scraped_count}, Failed: {failed_count}")
         return articles
         
     def save_results(self, articles: List[Dict]):
@@ -445,7 +454,7 @@ class RBNZScraper:
             if articles:
                 self.save_results(articles)
             else:
-                self.logger.warning("No articles were scraped")
+                self.logger.warning("No new articles were scraped")
                 
         except Exception as e:
             self.logger.error(f"Scraping failed: {e}")
@@ -460,7 +469,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='RBNZ News Scraper')
-    parser.add_argument('--max-pages', type=int, default=2,
+    parser.add_argument('--max-pages', type=int, default=1,
                        help='Maximum number of pages to scrape')
     parser.add_argument('--use-selenium', action='store_true',
                        help='Use Selenium WebDriver (required)')
@@ -477,7 +486,9 @@ def main():
     if args.test_url:
         scraper = RBNZScraper(use_selenium=args.use_selenium)
         result = scraper._extract_article_content(args.test_url)
-        if result:
+        if result == "ALREADY_SCRAPED":
+            print(f"↻ Article already scraped: {args.test_url}")
+        elif result:
             print(f"✓ Successfully scraped: {result['headline']}")
             print(f"  Date: {result['published_date']}")
             print(f"  Content length: {len(result['content_text'])} chars")

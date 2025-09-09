@@ -43,7 +43,7 @@ import tabula  # For table extraction from PDFs
 BASE_URL = "https://www.nhvr.gov.au"
 MEDIA_RELEASE_URL = "https://www.nhvr.gov.au/mediarelease"
 DATA_DIR = Path("data")
-MAX_PAGES = 2  # Set to 3 for daily runs, higher for full scrapes
+MAX_PAGES = 1  # Set to 3 for daily runs, higher for full scrapes
 DELAY_BETWEEN_REQUESTS = 2  # seconds
 PROCESSED_URLS_FILE = DATA_DIR / "processed_urls.json"
 
@@ -70,6 +70,7 @@ class NHVRScraper:
     def __init__(self):
         self.session = requests.Session()
         self.driver = None
+        self.driver_pid = None  # Track our specific driver process
         self.processed_urls: Set[str] = self.load_processed_urls()
         self.scraped_data: List[Dict] = []
         self.pdf_hashes: Set[str] = set()
@@ -104,29 +105,47 @@ class NHVRScraper:
         except Exception as e:
             logger.error(f"Could not save processed URLs: {e}")
 
-    def cleanup_chrome_processes(self):
-        """Kill any existing Chrome processes that might be interfering"""
+    def cleanup_own_chrome_processes(self):
+        """Clean up only Chrome processes belonging to this script instance"""
         try:
             import psutil
             killed_processes = 0
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    # Look for Chrome processes
-                    if proc.info['name'] and 'chrome' in proc.info['name'].lower():
-                        # Check if it's related to our scraper or automation
-                        cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
-                        if any(keyword in cmdline.lower() for keyword in ['automation', 'webdriver', 'chromedriver', 'remote-debugging']):
-                            logger.info(f"Killing Chrome process: PID {proc.info['pid']}")
-                            proc.terminate()
-                            killed_processes += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
             
+            # Only clean up if we have a tracked driver PID
+            if self.driver_pid:
+                try:
+                    # Get the main driver process
+                    main_proc = psutil.Process(self.driver_pid)
+                    
+                    # Get all child processes (Chrome browser processes spawned by this driver)
+                    children = main_proc.children(recursive=True)
+                    
+                    # Terminate child processes first
+                    for child in children:
+                        try:
+                            if 'chrome' in child.name().lower():
+                                logger.info(f"Killing child Chrome process: PID {child.pid}")
+                                child.terminate()
+                                killed_processes += 1
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    
+                    # Terminate the main driver process
+                    try:
+                        logger.info(f"Killing main driver process: PID {self.driver_pid}")
+                        main_proc.terminate()
+                        killed_processes += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                        
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    logger.warning(f"Could not access driver process PID {self.driver_pid}")
+                    
             if killed_processes > 0:
-                logger.info(f"Killed {killed_processes} Chrome processes")
+                logger.info(f"Cleaned up {killed_processes} Chrome processes belonging to this script")
                 time.sleep(2)  # Give time for processes to fully terminate
             else:
-                logger.info("No Chrome processes found to clean up")
+                logger.info("No Chrome processes found to clean up for this script")
                 
         except ImportError:
             logger.warning("psutil not available for process cleanup - continuing anyway")
@@ -206,6 +225,15 @@ class NHVRScraper:
             
             # Initialize driver with explicit service and options
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Track the driver process PID for targeted cleanup
+            try:
+                import psutil
+                self.driver_pid = self.driver.service.process.pid
+                logger.info(f"Driver process PID: {self.driver_pid}")
+            except Exception as e:
+                logger.warning(f"Could not track driver PID: {e}")
+                self.driver_pid = None
             
             # Set timeouts
             self.driver.implicitly_wait(10)
@@ -759,14 +787,11 @@ class NHVRScraper:
                     logger.info("WebDriver closed successfully")
                 except Exception as e:
                     logger.warning(f"Error closing WebDriver: {e}")
-                    # Force kill any remaining Chrome processes if needed
+                    # Only clean up our own Chrome processes
                     try:
-                        import psutil
-                        for proc in psutil.process_iter(['pid', 'name']):
-                            if 'chrome' in proc.info['name'].lower():
-                                proc.terminate()
-                    except:
-                        pass
+                        self.cleanup_own_chrome_processes()
+                    except Exception as cleanup_e:
+                        logger.warning(f"Error during targeted Chrome cleanup: {cleanup_e}")
 
     def save_data(self):
         """Save scraped data to JSON file"""
@@ -824,7 +849,7 @@ def main():
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
     finally:
-        # Ensure proper cleanup
+        # Ensure proper cleanup - only our own processes
         if scraper.driver:
             try:
                 scraper.driver.quit()
@@ -832,9 +857,9 @@ def main():
             except Exception as e:
                 logger.warning(f"WebDriver cleanup warning: {e}")
         
-        # Additional cleanup of any remaining Chrome processes
+        # Only clean up our own Chrome processes
         try:
-            scraper.cleanup_chrome_processes()
+            scraper.cleanup_own_chrome_processes()
         except Exception as e:
             logger.warning(f"Final Chrome cleanup warning: {e}")
 

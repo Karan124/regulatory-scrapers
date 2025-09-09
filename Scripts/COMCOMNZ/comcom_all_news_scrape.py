@@ -29,7 +29,7 @@ CSV_FILE = "comcom_nz_all_news.csv"
 LOG_FILE = "comcom_scraper.log"
 
 # Set to 3 for daily runs, or higher for initial full scrape
-MAX_PAGES = 3  # Change this manually for full scrape vs daily runs
+MAX_PAGES = 1  # Change this manually for full scrape vs daily runs
 
 # Create data folder if it doesn't exist
 os.makedirs(DATA_FOLDER, exist_ok=True)

@@ -776,9 +776,9 @@ class APRAScraper:
             
     def _extract_publication_details(self, pub_url: str) -> Optional[Dict]:
         """Extract detailed content from a publication page using Selenium."""
-        if pub_url in self.scraped_urls:
-            self.logger.info(f"Skipping already scraped URL: {pub_url}")
-            return None
+        # if pub_url in self.scraped_urls:
+        #     self.logger.info(f"Skipping already scraped URL: {pub_url}")
+        #     return None
             
         try:
             self.logger.info(f"Extracting publication: {pub_url}")
@@ -940,7 +940,7 @@ class APRAScraper:
                         })
                         
             # Generate content hash for deduplication
-            content_for_hash = f"{publication['headline']}{publication['main_content']}"
+            content_for_hash = f"{publication['url']}{publication['headline']}{publication['published_date']}{publication['main_content']}"
             publication['content_hash'] = self._generate_content_hash(content_for_hash)
             
             # Check for duplicates

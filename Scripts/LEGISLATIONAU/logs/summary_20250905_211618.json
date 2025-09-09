@@ -1,0 +1,41 @@
+{
+  "run_metadata": {
+    "scrape_timestamp": "2025-09-05T21:16:18.582879",
+    "scraper_version": "4.0.0",
+    "incremental_mode": true,
+    "processed_count": 75,
+    "skipped_count": 2,
+    "error_count": 0
+  },
+  "summary_by_type": {
+    "Acts": {
+      "new_items": 6,
+      "avg_content_length": 23823,
+      "date_range": {
+        "earliest": "2025-08-29",
+        "latest": "2025-09-05"
+      }
+    },
+    "Legislative Instruments": {
+      "new_items": 40,
+      "avg_content_length": 98448,
+      "date_range": {
+        "earliest": "2025-07-01",
+        "latest": "2025-09-05"
+      }
+    },
+    "Notifiable Instruments": {
+      "new_items": 29,
+      "avg_content_length": 3745,
+      "date_range": {
+        "earliest": "2025-08-29",
+        "latest": "2025-09-05"
+      }
+    }
+  },
+  "totals": {
+    "new_items": 75,
+    "total_skipped": 2,
+    "total_errors": 0
+  }
+}

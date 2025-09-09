@@ -28,7 +28,7 @@ from fake_useragent import UserAgent
 BASE_URL = "https://www.fma.govt.nz"
 ARTICLES_URL = f"{BASE_URL}/library/articles/"
 DATA_DIR = "data"
-MAX_PAGES = 3  # Set to 3 for daily runs, 10+ for initial full scrape
+MAX_PAGES = 1  # Set to 3 for daily runs, 10+ for initial full scrape
 DELAY_RANGE = (2, 5)  # Random delay between requests (seconds)
 
 # File paths
@@ -116,8 +116,10 @@ class FMAArticleScraper:
                 logger.error(f"Error loading existing articles: {str(e)}")
         return existing
     
+    # --- CHANGE 1: MODIFIED get_article_links FUNCTION ---
+    # This function now finds the date on the listing page and returns it along with the URL.
     def get_article_links(self, page_url):
-        """Extract article links from a page"""
+        """Extract article links and their dates from a listing page"""
         try:
             self.random_delay()
             response = self.session.get(page_url)
@@ -125,18 +127,25 @@ class FMAArticleScraper:
             
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Find article links using the recommended selector
             article_links = []
-            links = soup.find_all('a', href=True)
+            # Find the container for each search result
+            results = soup.find_all('section', class_='results-list__result-body')
             
-            for link in links:
-                href = link.get('href')
-                if href and '/library/articles/' in href and href != '/library/articles/':
-                    full_url = urljoin(BASE_URL, href)
+            for result in results:
+                link_tag = result.find('h3', class_='results-list__result-title').find('a')
+                date_tag = result.find('p', class_='results-list__result-date')
+                
+                if link_tag and link_tag.get('href'):
+                    full_url = urljoin(BASE_URL, link_tag.get('href'))
+                    title = link_tag.get_text(strip=True) or 'No title'
+                    # Get the date from the same container
+                    date = date_tag.get_text(strip=True) if date_tag else ""
+                    
                     if full_url not in [al['url'] for al in article_links]:
                         article_links.append({
                             'url': full_url,
-                            'title': link.get_text(strip=True) or 'No title'
+                            'title': title,
+                            'date': date  # Store the date
                         })
             
             logger.info(f"Found {len(article_links)} article links on page: {page_url}")
@@ -145,7 +154,7 @@ class FMAArticleScraper:
         except Exception as e:
             logger.error(f"Error getting article links from {page_url}: {str(e)}")
             return []
-    
+
     def get_pagination_urls(self, soup):
         """Extract pagination URLs"""
         pagination_urls = []
@@ -206,7 +215,9 @@ class FMAArticleScraper:
         
         return links
     
-    def scrape_article(self, article_url):
+    # --- CHANGE 2: MODIFIED scrape_article FUNCTION SIGNATURE ---
+    # This function now accepts the date as a parameter.
+    def scrape_article(self, article_url, published_date):
         """Scrape individual article"""
         try:
             # Check if already scraped
@@ -248,18 +259,7 @@ class FMAArticleScraper:
             if breadcrumbs:
                 theme = breadcrumbs.get_text(separator=' > ', strip=True)
             
-            # Extract published date
-            published_date = ""
-            date_patterns = [
-                soup.find('time'),
-                soup.find('span', class_='date'),
-                soup.find('div', class_='date')
-            ]
-            
-            for date_elem in date_patterns:
-                if date_elem:
-                    published_date = date_elem.get_text(strip=True)
-                    break
+            # --- The date is now passed in, so we remove the search logic here ---
             
             # Extract image
             image_url = ""
@@ -298,7 +298,7 @@ class FMAArticleScraper:
                 'title': title,
                 'description': description,
                 'theme': theme,
-                'published_date': published_date,
+                'published_date': published_date, # Use the passed-in date
                 'scraped_date': datetime.now().isoformat(),
                 'content': full_content,
                 'image_url': image_url,
@@ -379,7 +379,8 @@ class FMAArticleScraper:
                     if article_url in self.existing_articles:
                         continue
                     
-                    article_data = self.scrape_article(article_url)
+                    # --- CHANGE 3: PASS THE DATE TO THE scrape_article FUNCTION ---
+                    article_data = self.scrape_article(article_url, link_info['date'])
                     if article_data:
                         all_articles.append(article_data)
                         new_articles_count += 1

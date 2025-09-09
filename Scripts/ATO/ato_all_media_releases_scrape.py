@@ -551,7 +551,7 @@ class ATOMediaScraperSelenium:
             # Wait for at least one search result item
             wait.until(EC.presence_of_element_located((
                 By.CSS_SELECTOR, 
-                'div.AtoSearchResultsItem_result-item__DBedq[data-testid="AtoSearchResultItem-element"]'
+                'div.RclSearchResultsItem_result-item__0Ubh_[data-testid="AtoSearchResultItem-element"]'
             )))
             
             self.logger.info("Search results loaded successfully")
@@ -579,9 +579,9 @@ class ATOMediaScraperSelenium:
         try:
             # Find all search result items using the exact selector from the HTML you provided
             result_items = driver.find_elements(
-                By.CSS_SELECTOR, 
-                'div.AtoSearchResultsItem_result-item__DBedq[data-testid="AtoSearchResultItem-element"]'
-            )
+               By.CSS_SELECTOR, 
+                'div.RclSearchResultsItem_result-item__0Ubh_[data-testid="AtoSearchResultItem-element"]'
+                     )
             
             self.logger.info(f"Found {len(result_items)} search result items")
             
@@ -604,7 +604,8 @@ class ATOMediaScraperSelenium:
         
         try:
             # Extract URL using the exact selector
-            link_element = element.find_element(By.CSS_SELECTOR, 'a.AtoSearchResultsItem_result-item__title__i4i4q')
+            # Extract URL using the exact selector
+            link_element = element.find_element(By.CSS_SELECTOR, 'a.RclSearchResultsItem_result-item__title__H1OVM')
             href = link_element.get_attribute('href')
             
             if not href:
@@ -616,7 +617,7 @@ class ATOMediaScraperSelenium:
                 return None
             
             # Extract title using the exact selector
-            title_element = link_element.find_element(By.CSS_SELECTOR, 'h2.AtoSearchResultsItem_result-item__heading__fpfOa')
+            title_element = link_element.find_element(By.CSS_SELECTOR, 'h2.RclSearchResultsItem_result-item__heading__dlJVP')
             title = title_element.text.strip()
             
             if not title:
@@ -633,7 +634,7 @@ class ATOMediaScraperSelenium:
             
             # Extract article type
             try:
-                type_element = element.find_element(By.CSS_SELECTOR, 'span.AtoSearchResultsItem_result-item__tag__WPGUA')
+                type_element = element.find_element(By.CSS_SELECTOR, 'span.RclSearchResultsItem_result-item__tag__V0tMs')
                 article_type = type_element.text.strip()
             except NoSuchElementException:
                 article_type = "Media Release"
@@ -667,7 +668,7 @@ class ATOMediaScraperSelenium:
         
         try:
             # Find all tag containers
-            tag_containers = element.find_elements(By.CSS_SELECTOR, 'div.AtoSearchResultsItem_result-item__tag-container__igzuF')
+            tag_containers = element.find_elements(By.CSS_SELECTOR, 'div.RclSearchResultsItem_result-item__tag-container__TOlin')
             
             for container in tag_containers:
                 text = container.text.strip()
@@ -759,7 +760,7 @@ class ATOMediaScraperSelenium:
                 # Wait for content to load properly
                 try:
                     WebDriverWait(self.driver, 15).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, 'div.AtoContentWrapper_rich-text-content__HY8CB'))
+                        EC.presence_of_element_located((By.CSS_SELECTOR, 'div.RclContentWrapper_rich-text-content__9GuOe'))
                     )
                     self.logger.debug("Content area loaded successfully")
                 except TimeoutException:
@@ -775,9 +776,9 @@ class ATOMediaScraperSelenium:
                 content_text = ""
                 
                 # Method 1: Try primary ATO content container (most specific)
-                content_elem = soup.select_one('div.AtoContentWrapper_rich-text-content__HY8CB')
+                content_elem = soup.select_one('div.RclContentWrapper_rich-text-content__9GuOe')
                 if content_elem:
-                    self.logger.info("✅ Found content using primary ATO selector: div.AtoContentWrapper_rich-text-content__HY8CB")
+                    self.logger.info("✅ Found content using primary ATO selector: div.RclContentWrapper_rich-text-content__HY8CB")
                     
                     # Remove unwanted elements
                     for tag in content_elem(['script', 'style', 'aside', 'nav', 'footer', 'header', 'button']):
@@ -881,7 +882,7 @@ class ATOMediaScraperSelenium:
                 # Extract related links from the content area
                 links = []
                 if content_text and content_text != "ACCESS_DENIED":
-                    content_area = soup.select_one('div.AtoContentWrapper_rich-text-content__HY8CB') or soup.select_one('section#content')
+                    content_area = soup.select_one('div.RclContentWrapper_rich-text-content__9GuOe') or soup.select_one('section#content')
                     if content_area:
                         for a_tag in content_area.find_all('a', href=True)[:10]:
                             href = a_tag['href']
@@ -971,7 +972,7 @@ class ATOMediaScraperSelenium:
             if not self.initial_run:
                 current_items = driver.find_elements(
                     By.CSS_SELECTOR, 
-                    'div.AtoSearchResultsItem_result-item__DBedq[data-testid="AtoSearchResultItem-element"]'
+                    'div.RclSearchResultsItem_result-item__0Ubh_[data-testid="AtoSearchResultItem-element"]'
                 )
                 
                 # Check recent items for age
@@ -992,7 +993,7 @@ class ATOMediaScraperSelenium:
             
             # Look for ATO pagination - try Next button first
             try:
-                next_button = driver.find_element(By.CSS_SELECTOR, 'button.AtoPagination_pagination__btn--next__cl5GH')
+                next_button = driver.find_element(By.CSS_SELECTOR, 'button.RclPagination_pagination__btn--next__3eCJA')
                 if next_button.is_enabled() and next_button.is_displayed():
                     run_type = "initial" if self.initial_run else "daily"
                     self.logger.info(f"Clicking 'Next' button for page {page_num} ({run_type} run)")
@@ -1009,9 +1010,9 @@ class ATOMediaScraperSelenium:
                     try:
                         WebDriverWait(driver, 10).until(
                             EC.presence_of_element_located((
-                                By.CSS_SELECTOR, 
-                                'div.AtoSearchResultsItem_result-item__DBedq[data-testid="AtoSearchResultItem-element"]'
-                            ))
+                            By.CSS_SELECTOR, 
+                            'div.RclSearchResultsItem_result-item__0Ubh_[data-testid="AtoSearchResultItem-element"]'
+                                ))
                         )
                         return True
                     except TimeoutException:
@@ -1023,7 +1024,7 @@ class ATOMediaScraperSelenium:
             
             # Fallback: Try clicking specific page number button
             try:
-                page_button_selector = f'button.AtoPagination_pagination__btn__Yynmp[aria-label="Goto Page{page_num}"]'
+                page_button_selector = f'button.RclPagination_pagination__btn__A_Os8[aria-label="Goto Page{page_num}"]'
                 page_button = driver.find_element(By.CSS_SELECTOR, page_button_selector)
                 
                 if page_button.is_enabled() and page_button.is_displayed():
@@ -1042,9 +1043,9 @@ class ATOMediaScraperSelenium:
                     try:
                         WebDriverWait(driver, 10).until(
                             EC.presence_of_element_located((
-                                By.CSS_SELECTOR, 
-                                'div.AtoSearchResultsItem_result-item__DBedq[data-testid="AtoSearchResultItem-element"]'
-                            ))
+                                  By.CSS_SELECTOR, 
+                                'div.RclSearchResultsItem_result-item__0Ubh_[data-testid="AtoSearchResultItem-element"]'
+                ))
                         )
                         return True
                     except TimeoutException:
@@ -1057,7 +1058,7 @@ class ATOMediaScraperSelenium:
             # If both methods fail, check if we've reached the end
             try:
                 # Check if there are any more page buttons available
-                all_page_buttons = driver.find_elements(By.CSS_SELECTOR, 'button.AtoPagination_pagination__btn__Yynmp[aria-label*="Goto Page"]')
+                all_page_buttons = driver.find_elements(By.CSS_SELECTOR, 'button.RclPagination_pagination__btn__A_Os8[aria-label*="Goto Page"]')
                 available_pages = []
                 
                 for button in all_page_buttons:

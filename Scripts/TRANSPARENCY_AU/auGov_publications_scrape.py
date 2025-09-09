@@ -8,7 +8,7 @@ from https://www.transparency.gov.au/publications
 Features:
 - Anti-bot detection avoidance with stealth techniques
 - PDF extraction with table support
-- Deduplication logic
+- Proper deduplication logic using unique IDs
 - LLM-friendly structured output
 - Comprehensive logging
 - Session-based browsing simulation
@@ -77,8 +77,8 @@ class TransparencyPortalScraper:
         self.driver = None
         self.setup_session()
         
-        # Deduplication tracking
-        self.scraped_urls: Set[str] = set()
+        # FIXED: Deduplication tracking using unique IDs instead of URLs
+        self.scraped_unique_ids: Set[str] = set()
         self.existing_data: List[Dict] = []
         self.load_existing_data()
         
@@ -224,18 +224,27 @@ class TransparencyPortalScraper:
             raise
             
     def load_existing_data(self):
-        """Load existing scraped data to avoid duplicates"""
+        """FIXED: Load existing scraped data to avoid duplicates using unique IDs"""
         if self.output_file.exists():
             try:
                 with open(self.output_file, 'r', encoding='utf-8') as f:
                     self.existing_data = json.load(f)
                     
-                # Extract URLs for deduplication
+                # FIXED: Extract unique IDs for deduplication instead of URLs
                 for item in self.existing_data:
-                    if 'url' in item:
-                        self.scraped_urls.add(item['url'])
+                    if 'unique_id' in item:
+                        self.scraped_unique_ids.add(item['unique_id'])
+                    else:
+                        # For backwards compatibility, create unique ID for existing records without one
+                        unique_id = self.create_unique_id(
+                            item.get('title', ''),
+                            item.get('published_date', ''),
+                            item.get('url', '')
+                        )
+                        item['unique_id'] = unique_id
+                        self.scraped_unique_ids.add(unique_id)
                         
-                self.logger.info(f"Loaded {len(self.existing_data)} existing records")
+                self.logger.info(f"Loaded {len(self.existing_data)} existing records with {len(self.scraped_unique_ids)} unique IDs")
                 
             except Exception as e:
                 self.logger.warning(f"Could not load existing data: {e}")
@@ -406,7 +415,7 @@ class TransparencyPortalScraper:
             else:
                 published_date = datetime.now().strftime('%Y-%m-%d')
             
-            return {
+            pub_data = {
                 'title': title,
                 'url': url,
                 'published_date': published_date,
@@ -415,6 +424,11 @@ class TransparencyPortalScraper:
                 'year': year,
                 'scraped_date': datetime.now().isoformat()
             }
+            
+            # FIXED: Create unique ID immediately when extracting metadata
+            pub_data['unique_id'] = self.create_unique_id(title, published_date, url)
+            
+            return pub_data
             
         except Exception as e:
             self.logger.error(f"Failed to extract metadata: {e}")
@@ -524,8 +538,7 @@ class TransparencyPortalScraper:
                 'content_text': self.clean_text(content_text),
                 'content_pdf_text': self.clean_text(pdf_content) if pdf_content else None,
                 'related_links': related_links,
-                'associated_image': None,
-                'unique_id': self.create_unique_id(pub_data['title'], pub_data['published_date'], pub_data['url'])
+                'associated_image': None
             })
             
             self.stats['total_processed'] += 1
@@ -569,8 +582,7 @@ class TransparencyPortalScraper:
             pub_data.update({
                 'content_text': self.clean_text(content_text),
                 'content_pdf_text': self.clean_text(pdf_content) if pdf_content else None,
-                'related_links': related_links,
-                'unique_id': self.create_unique_id(pub_data['title'], pub_data['published_date'], pub_data['url'])
+                'related_links': related_links
             })
             self.stats['total_processed'] += 1
             return pub_data
@@ -1089,7 +1101,7 @@ class TransparencyPortalScraper:
         pdf_links = []
         
         # Find all links that point to PDFs
-        links = soup.find_all('a', href=re.compile(r'\.pdf$', re.I))
+        links = soup.find_all('a', href=re.compile(r'\.pdf', re.I))
         
         for link in links:
             pdf_url = urljoin(base_url, link['href'])
@@ -1300,19 +1312,25 @@ class TransparencyPortalScraper:
         return text.strip()
             
     def save_data(self, all_publications: List[Dict]):
-        """Save scraped data to JSON file"""
+        """FIXED: Save scraped data to JSON file with proper unique ID deduplication"""
         try:
-            # Combine with existing data, removing duplicates
+            # Combine with existing data, removing duplicates by unique ID
             combined_data = self.existing_data.copy()
             
             # Create a set of existing unique IDs for faster lookups
             existing_ids = {item.get('unique_id') for item in combined_data if 'unique_id' in item}
             
             for pub in all_publications:
-                # Ensure the pub has content before saving
-                if pub.get('unique_id') and pub.get('unique_id') not in existing_ids and pub.get('content_text'):
+                # FIXED: Ensure the pub has content before saving and use unique ID for deduplication
+                if (pub.get('unique_id') and 
+                    pub.get('unique_id') not in existing_ids and 
+                    pub.get('content_text')):
                     combined_data.append(pub)
+                    existing_ids.add(pub.get('unique_id'))  # Track newly added IDs
                     self.stats['new_records'] += 1
+                elif pub.get('unique_id') in existing_ids:
+                    self.logger.info(f"Skipping duplicate record: {pub.get('title')} (ID: {pub.get('unique_id')[:8]}...)")
+                    self.stats['duplicates_skipped'] += 1
                 elif not pub.get('content_text'):
                     self.logger.warning(f"Skipping record with no content: {pub.get('title')}")
                     
@@ -1326,7 +1344,7 @@ class TransparencyPortalScraper:
             self.logger.error(f"Failed to save data: {e}")
             
     def run(self):
-        """Main scraping execution"""
+        """Main scraping execution with FIXED deduplication logic"""
         start_time = datetime.now()
         self.logger.info(f"Starting scraper run at {start_time}")
         
@@ -1353,14 +1371,20 @@ class TransparencyPortalScraper:
                     self.logger.info(f"No publications found on page {page_num}. Ending link collection.")
                     break
                 
-                # Filter out already scraped URLs
-                new_pubs = [pub for pub in publications_on_page if pub['url'] not in self.scraped_urls]
+                # FIXED: Filter out already scraped publications using unique IDs instead of URLs
+                new_pubs = [pub for pub in publications_on_page 
+                           if pub.get('unique_id') and pub.get('unique_id') not in self.scraped_unique_ids]
                 skipped_count = len(publications_on_page) - len(new_pubs)
                 if skipped_count > 0:
                     self.logger.info(f"Skipped {skipped_count} already processed publications on this page.")
                     self.stats['duplicates_skipped'] += skipped_count
 
                 all_publications_metadata.extend(new_pubs)
+                
+                # Add unique IDs to tracking set to avoid processing later pages
+                for pub in new_pubs:
+                    if pub.get('unique_id'):
+                        self.scraped_unique_ids.add(pub.get('unique_id'))
                 
                 # Find and click the 'Next' button
                 try:
@@ -1421,7 +1445,7 @@ class TransparencyPortalScraper:
             self.logger.info(f"Duration: {duration}")
             self.logger.info(f"Total new records with content: {self.stats['new_records']}")
             self.logger.info(f"Total publications processed: {self.stats['total_processed']}")
-            self.logger.info(f"Duplicates skipped from previous runs: {len(self.scraped_urls)}")
+            self.logger.info(f"Duplicates skipped from previous runs: {len(self.scraped_unique_ids)}")
             self.logger.info(f"PDF extractions: {self.stats['pdf_extractions']}")
             self.logger.info(f"PDF pages processed: {self.stats['pdf_pages_processed']}")
             self.logger.info(f"Errors: {self.stats['errors']}")

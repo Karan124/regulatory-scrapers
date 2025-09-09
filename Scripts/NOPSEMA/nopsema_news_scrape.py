@@ -89,10 +89,11 @@ class NOPSEMAScraper:
         """Check if article is already scraped."""
         article_hash = self._get_article_hash(url, headline)
         for article in self.existing_articles:
-            if (article.get('url') == url or 
-                article.get('headline') == headline or
-                article.get('hash') == article_hash):
+            if article.get('url') == url:
                 return True
+            if article.get('hash') == article_hash:
+                return True
+       
         return False
     
     def _human_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):

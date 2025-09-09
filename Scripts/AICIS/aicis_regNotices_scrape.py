@@ -11,7 +11,7 @@ with anti-bot measures, pagination support, and comprehensive data extraction.
 # ============================================================================
 
 # Scraping limits
-MAX_PAGES = 1  # Set to None for all pages, or specify a number (e.g., 3 for daily runs)
+MAX_PAGES = 2  # Set to None for all pages, or specify a number (e.g., 3 for daily runs)
 REQUEST_DELAY = 1  # Seconds between individual notice requests
 PAGE_DELAY = 2     # Seconds between pagination requests
 TIMEOUT = 30       # Request timeout in seconds
@@ -730,7 +730,7 @@ Examples:
         """
     )
     
-    parser.add_argument('--max-pages', type=int, default=None,
+    parser.add_argument('--max-pages', type=int, default=2,
                        help='Maximum number of pages to scrape (overrides config default)')
     parser.add_argument('--show-config', action='store_true',
                        help='Show current configuration and exit')

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Fixed AUSTRAC Media Releases Scraper
-Addresses issues in the original script and updates for current website structure
-FIXED CHROME DRIVER SETUP
+Enhanced AUSTRAC Media Releases Scraper - Fully Corrected Working Version
+- LLM-friendly content extraction with structured formatting
+- PDF and Excel/CSV document extraction with full text content
+- JSON-only output optimized for LLM analysis
+- Enhanced content cleaning and structuring
 """
 
 import os
@@ -12,9 +14,17 @@ import hashlib
 import logging
 import re
 import random
+import io
+import subprocess
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
+import requests
+import signal
+import sys
+
+# Core scraping libraries
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -23,12 +33,40 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from bs4 import BeautifulSoup
-import pandas as pd
 import urllib3
-import signal
-import sys
 
-# Disable insecure request warnings
+# Document processing libraries
+try:
+    import PyPDF2
+    HAS_PYPDF2 = True
+except ImportError:
+    HAS_PYPDF2 = False
+
+try:
+    import pymupdf as fitz
+    HAS_PYMUPDF = True
+except ImportError:
+    HAS_PYMUPDF = False
+
+try:
+    import pdfplumber
+    HAS_PDFPLUMBER = True
+except ImportError:
+    HAS_PDFPLUMBER = False
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
+# Disable warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ----------------------------
@@ -39,19 +77,20 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [%(funcName)s:%(lineno)d]: %(message)s',
     handlers=[
-        logging.FileHandler('data/austrac_media_scraper.log', mode='a', encoding='utf-8'),
+        logging.FileHandler('data/austrac_enhanced_scraper.log', mode='a', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Log available document processing libraries
+logger.info(f"Document processing libraries: PyPDF2={HAS_PYPDF2}, PyMuPDF={HAS_PYMUPDF}, pdfplumber={HAS_PDFPLUMBER}, openpyxl={HAS_OPENPYXL}, pandas={HAS_PANDAS}")
 
 # ----------------------------
 # Configuration
 # ----------------------------
 DATA_DIR = Path("data")
 JSON_PATH = DATA_DIR / "austrac_media.json"
-CSV_PATH = DATA_DIR / "austrac_media.csv"
-CHECKPOINT_PATH = DATA_DIR / "media_scraper_checkpoint.json"
 
 BASE_URL = "https://www.austrac.gov.au"
 TARGET_URL = f"{BASE_URL}/news-and-media/media-release"
@@ -59,14 +98,11 @@ PAGE_LOAD_TIMEOUT = 30
 ARTICLE_TIMEOUT = 20
 DELAY_BETWEEN_REQUESTS = 3
 MAX_RETRIES = 3
-MAX_PAGES = 3  # Reasonable limit
+MAX_PAGES = 1  # Configurable for full fresh scrape
 
 # Global variables for graceful shutdown
 shutdown_requested = False
 
-# ----------------------------
-# Signal Handler for Graceful Shutdown
-# ----------------------------
 def signal_handler(signum, frame):
     global shutdown_requested
     logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
@@ -75,11 +111,313 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-class AUSTRACMediaScraperFixed:
-    """
-    Fixed AUSTRAC Media Releases scraper with improved error handling and current website structure
-    FIXED CHROME DRIVER SETUP
-    """
+class DocumentProcessor:
+    """Enhanced document processor for PDFs, Excel, and CSV files"""
+    
+    @staticmethod
+    def clean_text_for_llm(text: str) -> str:
+        """Clean and structure text content for optimal LLM processing"""
+        if not text:
+            return ""
+        
+        # Remove excessive whitespace while preserving paragraph structure
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'^\s+|\s+$', '', text, flags=re.MULTILINE)
+        
+        # Remove page numbers and headers/footers
+        text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
+        text = re.sub(r'\n\s*Page \d+ of \d+\s*\n', '\n', text, flags=re.IGNORECASE)
+        
+        # Clean up common document artifacts
+        text = re.sub(r'[^\w\s\.\,\;\:\!\?\-\(\)\[\]\{\}\"\'\/\\\@\#\$\%\&\*\+\=\<\>\~\`\|\n]', '', text)
+        
+        # Ensure proper sentence spacing
+        text = re.sub(r'\.([A-Z])', r'. \1', text)
+        text = re.sub(r'\?([A-Z])', r'? \1', text)
+        text = re.sub(r'\!([A-Z])', r'! \1', text)
+        
+        return text.strip()
+    
+    @staticmethod
+    def extract_pdf_content(pdf_url: str) -> Dict[str, Any]:
+        """Extract comprehensive content from PDF with multiple methods"""
+        result = {
+            'success': False,
+            'text_content': '',
+            'metadata': {},
+            'extraction_method': '',
+            'page_count': 0,
+            'file_size_mb': 0,
+            'error': None
+        }
+        
+        try:
+            logger.info(f"Downloading PDF: {pdf_url}")
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            
+            response = requests.get(pdf_url, headers=headers, timeout=60, verify=False)
+            if response.status_code != 200:
+                result['error'] = f"HTTP {response.status_code}"
+                return result
+            
+            pdf_content = response.content
+            result['file_size_mb'] = round(len(pdf_content) / 1024 / 1024, 2)
+            
+            extracted_text = ""
+            
+            # Method 1: Try PyMuPDF (best for comprehensive extraction)
+            if HAS_PYMUPDF and not extracted_text:
+                try:
+                    pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
+                    result['page_count'] = pdf_document.page_count
+                    
+                    # Extract metadata
+                    metadata = pdf_document.metadata
+                    result['metadata'] = {
+                        'title': metadata.get('title', ''),
+                        'author': metadata.get('author', ''),
+                        'subject': metadata.get('subject', ''),
+                        'creator': metadata.get('creator', ''),
+                        'creation_date': metadata.get('creationDate', ''),
+                        'modification_date': metadata.get('modDate', '')
+                    }
+                    
+                    text_parts = []
+                    for page_num in range(pdf_document.page_count):
+                        page = pdf_document[page_num]
+                        
+                        # Extract text blocks for better structure
+                        blocks = page.get_text("blocks")
+                        page_text_parts = []
+                        
+                        for block in blocks:
+                            if len(block) > 4 and block[4].strip():
+                                page_text_parts.append(block[4].strip())
+                        
+                        if page_text_parts:
+                            page_text = "\n".join(page_text_parts)
+                            text_parts.append(f"\n--- PAGE {page_num + 1} ---\n{page_text}")
+                    
+                    pdf_document.close()
+                    
+                    if text_parts:
+                        extracted_text = "\n\n".join(text_parts)
+                        result['extraction_method'] = 'PyMuPDF'
+                        logger.info(f"PyMuPDF extracted {len(extracted_text)} characters from {result['page_count']} pages")
+                
+                except Exception as e:
+                    logger.warning(f"PyMuPDF extraction failed: {e}")
+            
+            # Method 2: Try pdfplumber (excellent for tables and structured content)
+            if HAS_PDFPLUMBER and not extracted_text:
+                try:
+                    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+                        result['page_count'] = len(pdf.pages)
+                        text_parts = []
+                        
+                        for page_num, page in enumerate(pdf.pages):
+                            # Extract regular text
+                            page_text = page.extract_text()
+                            if page_text and page_text.strip():
+                                text_parts.append(f"\n--- PAGE {page_num + 1} ---\n{page_text.strip()}")
+                            
+                            # Extract tables separately
+                            tables = page.extract_tables()
+                            if tables:
+                                for table_num, table in enumerate(tables):
+                                    if table:
+                                        table_text = "\n".join([
+                                            " | ".join([str(cell) if cell else "" for cell in row])
+                                            for row in table if row
+                                        ])
+                                        if table_text.strip():
+                                            text_parts.append(f"\n--- TABLE {table_num + 1} (PAGE {page_num + 1}) ---\n{table_text}")
+                        
+                        if text_parts:
+                            extracted_text = "\n\n".join(text_parts)
+                            result['extraction_method'] = 'pdfplumber'
+                            logger.info(f"pdfplumber extracted {len(extracted_text)} characters from {result['page_count']} pages")
+                
+                except Exception as e:
+                    logger.warning(f"pdfplumber extraction failed: {e}")
+            
+            # Method 3: Fallback to PyPDF2
+            if HAS_PYPDF2 and not extracted_text:
+                try:
+                    pdf_file = io.BytesIO(pdf_content)
+                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    result['page_count'] = len(pdf_reader.pages)
+                    
+                    text_parts = []
+                    for page_num, page in enumerate(pdf_reader.pages):
+                        page_text = page.extract_text()
+                        if page_text and page_text.strip():
+                            text_parts.append(f"\n--- PAGE {page_num + 1} ---\n{page_text.strip()}")
+                    
+                    if text_parts:
+                        extracted_text = "\n\n".join(text_parts)
+                        result['extraction_method'] = 'PyPDF2'
+                        logger.info(f"PyPDF2 extracted {len(extracted_text)} characters from {result['page_count']} pages")
+                
+                except Exception as e:
+                    logger.warning(f"PyPDF2 extraction failed: {e}")
+            
+            if extracted_text:
+                # Clean and structure text for LLM
+                cleaned_text = DocumentProcessor.clean_text_for_llm(extracted_text)
+                
+                # Add extraction metadata
+                metadata_header = f"""--- PDF DOCUMENT METADATA ---
+Source URL: {pdf_url}
+Extraction Date: {datetime.now().isoformat()}
+File Size: {result['file_size_mb']} MB
+Page Count: {result['page_count']}
+Extraction Method: {result['extraction_method']}
+Content Length: {len(cleaned_text)} characters
+--- END METADATA ---
+
+"""
+                
+                result['text_content'] = metadata_header + cleaned_text
+                result['success'] = True
+                
+                logger.info(f"Successfully extracted PDF content: {len(result['text_content'])} characters")
+            else:
+                result['error'] = "No text could be extracted"
+                logger.warning(f"No text extracted from PDF: {pdf_url}")
+            
+            return result
+            
+        except Exception as e:
+            result['error'] = str(e)
+            logger.error(f"Error extracting PDF {pdf_url}: {e}")
+            return result
+    
+    @staticmethod
+    def extract_excel_content(excel_url: str) -> Dict[str, Any]:
+        """Extract content from Excel/CSV files"""
+        result = {
+            'success': False,
+            'text_content': '',
+            'sheet_data': {},
+            'metadata': {},
+            'file_size_mb': 0,
+            'error': None
+        }
+        
+        try:
+            logger.info(f"Downloading Excel/CSV: {excel_url}")
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(excel_url, headers=headers, timeout=60, verify=False)
+            if response.status_code != 200:
+                result['error'] = f"HTTP {response.status_code}"
+                return result
+            
+            file_content = response.content
+            result['file_size_mb'] = round(len(file_content) / 1024 / 1024, 2)
+            
+            # Determine file type
+            file_extension = Path(urlparse(excel_url).path).suffix.lower()
+            
+            content_parts = []
+            
+            if file_extension in ['.xlsx', '.xls'] and HAS_OPENPYXL:
+                try:
+                    # Process Excel file
+                    from openpyxl import load_workbook
+                    workbook = load_workbook(io.BytesIO(file_content), read_only=True)
+                    
+                    result['metadata']['sheet_names'] = workbook.sheetnames
+                    result['metadata']['sheet_count'] = len(workbook.sheetnames)
+                    
+                    for sheet_name in workbook.sheetnames:
+                        sheet = workbook[sheet_name]
+                        sheet_data = []
+                        
+                        # Convert to list of lists
+                        for row in sheet.iter_rows(values_only=True):
+                            if any(cell is not None for cell in row):  # Skip empty rows
+                                sheet_data.append([str(cell) if cell is not None else '' for cell in row])
+                        
+                        if sheet_data:
+                            # Convert to structured text
+                            sheet_text = f"\n--- SHEET: {sheet_name} ---\n"
+                            for row_num, row in enumerate(sheet_data):
+                                if row_num == 0:  # Header row
+                                    sheet_text += f"HEADERS: {' | '.join(row)}\n"
+                                    sheet_text += "-" * 50 + "\n"
+                                else:
+                                    sheet_text += f"ROW {row_num}: {' | '.join(row)}\n"
+                            
+                            content_parts.append(sheet_text)
+                            result['sheet_data'][sheet_name] = sheet_data
+                    
+                    workbook.close()
+                    logger.info(f"Extracted {len(workbook.sheetnames)} sheets from Excel file")
+                
+                except Exception as e:
+                    logger.warning(f"Excel processing failed: {e}")
+            
+            elif file_extension == '.csv' and HAS_PANDAS:
+                try:
+                    # Process CSV file
+                    df = pd.read_csv(io.BytesIO(file_content))
+                    
+                    result['metadata']['row_count'] = len(df)
+                    result['metadata']['column_count'] = len(df.columns)
+                    result['metadata']['columns'] = list(df.columns)
+                    
+                    # Convert to structured text
+                    csv_text = f"\n--- CSV DATA ---\n"
+                    csv_text += f"COLUMNS: {' | '.join(df.columns)}\n"
+                    csv_text += "-" * 50 + "\n"
+                    
+                    for index, row in df.iterrows():
+                        row_text = f"ROW {index + 1}: {' | '.join([str(val) for val in row.values])}\n"
+                        csv_text += row_text
+                    
+                    content_parts.append(csv_text)
+                    result['sheet_data']['csv_data'] = df.to_dict('records')
+                    
+                    logger.info(f"Extracted CSV with {len(df)} rows and {len(df.columns)} columns")
+                
+                except Exception as e:
+                    logger.warning(f"CSV processing failed: {e}")
+            
+            if content_parts:
+                # Add metadata header
+                metadata_header = f"""--- SPREADSHEET DOCUMENT METADATA ---
+Source URL: {excel_url}
+Extraction Date: {datetime.now().isoformat()}
+File Size: {result['file_size_mb']} MB
+File Type: {file_extension}
+Sheets/Tables: {result['metadata'].get('sheet_count', 1)}
+--- END METADATA ---
+
+"""
+                
+                result['text_content'] = metadata_header + "\n\n".join(content_parts)
+                result['success'] = True
+                
+                logger.info(f"Successfully extracted spreadsheet content: {len(result['text_content'])} characters")
+            else:
+                result['error'] = "No data could be extracted"
+            
+            return result
+            
+        except Exception as e:
+            result['error'] = str(e)
+            logger.error(f"Error extracting spreadsheet {excel_url}: {e}")
+            return result
+
+class AUSTRACEnhancedScraper:
+    """Enhanced AUSTRAC scraper with LLM-optimized content extraction"""
     
     def __init__(self):
         self.base_url = BASE_URL
@@ -87,75 +425,84 @@ class AUSTRACMediaScraperFixed:
         self.data_folder = DATA_DIR
         self.data_folder.mkdir(exist_ok=True)
         
-        # File paths
         self.json_file = JSON_PATH
-        self.csv_file = CSV_PATH
-        self.checkpoint_file = CHECKPOINT_PATH
-        
         self.driver = None
         self.existing_hashes = set()
+        self.doc_processor = DocumentProcessor()
         
-        # Load existing data for deduplication
         self._load_existing_data()
     
     def _load_existing_data(self):
-        """Load existing media releases to prevent duplicates"""
+        """Load existing data to prevent duplicates"""
         if self.json_file.exists():
             try:
                 with open(self.json_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-                    self.existing_hashes = {item.get('hash_id', '') for item in existing_data}
-                    logger.info(f"Loaded {len(self.existing_hashes)} existing media release records")
+                    data = json.load(f)
+                    # Handle both old format (list) and new format (dict with articles key)
+                    if isinstance(data, list):
+                        existing_data = data
+                    else:
+                        existing_data = data.get('articles', [])
+                    
+                    self.existing_hashes = {item.get('hash_id', '') for item in existing_data if item.get('hash_id')}
+                    logger.info(f"Loaded {len(self.existing_hashes)} existing records")
             except Exception as e:
                 logger.error(f"Error loading existing data: {e}")
                 self.existing_hashes = set()
         else:
-            logger.info("No existing data file found, starting fresh")
+            logger.info("No existing data file found - starting fresh")
     
     def _generate_hash(self, url: str, headline: str, published_date: str) -> str:
         """Generate unique hash for media release"""
         content = f"{url}_{headline}_{published_date}"
-        return hashlib.sha256(content.encode()).hexdigest()
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
     
     def _setup_driver(self):
-        """Simplified Chrome WebDriver setup - let system handle Chrome detection."""
+        """Setup Chrome WebDriver with enhanced compatibility"""
         chrome_options = Options()
         
-        # Essential stability options for Linux
+        # Essential stability options for Linux/WSL
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1920,1080")
-        
-        # Updated user agent to match current Chrome version
-        chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-features=TranslateUI")
+        chrome_options.add_argument("--disable-ipc-flooding-protection")
         
         # Stealth options
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        # Performance optimizations
+        # Set realistic window size
+        chrome_options.add_argument("--window-size=1920,1080")
+        
+        # Updated user agent
+        chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+        
+        # Headless mode
+        chrome_options.add_argument("--headless=new")
+        
+        # Memory and performance optimizations
+        chrome_options.add_argument("--max_old_space_size=4096")
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--disable-plugins")
-        chrome_options.add_argument("--disable-images")  # Speed up loading
-        chrome_options.add_argument("--disable-background-timer-throttling")
-        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_argument("--disable-renderer-backgrounding")
         chrome_options.add_argument("--disable-logging")
         chrome_options.add_argument("--log-level=3")
         chrome_options.add_argument("--silent")
         
-        # Memory management
-        chrome_options.add_argument("--max_old_space_size=4096")
-        chrome_options.add_argument("--disable-ipc-flooding-protection")
+        # Network optimizations
+        chrome_options.add_argument("--aggressive-cache-discard")
+        chrome_options.add_argument("--disable-background-networking")
         
         try:
             # Try to find ChromeDriver
             possible_chromedriver_paths = [
                 "/usr/bin/chromedriver",
-                "/usr/local/bin/chromedriver",
+                "/usr/local/bin/chromedriver", 
                 "/snap/bin/chromedriver"
             ]
             
@@ -166,13 +513,15 @@ class AUSTRACMediaScraperFixed:
                     logger.info(f"Found ChromeDriver at: {path}")
                     break
             
-            # Initialize driver with simplified service configuration
-            service_kwargs = {}
+            # Initialize driver with improved service configuration
             if chromedriver_path:
-                service_kwargs['executable_path'] = chromedriver_path
-            
-            service = Service(**service_kwargs)
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                service = Service(chromedriver_path)
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                logger.info(f"Using ChromeDriver: {chromedriver_path}")
+            else:
+                # Try without specifying path (let system find it)
+                self.driver = webdriver.Chrome(options=chrome_options)
+                logger.info("Using ChromeDriver from PATH")
             
             # Set timeouts
             self.driver.implicitly_wait(10)
@@ -186,21 +535,29 @@ class AUSTRACMediaScraperFixed:
             
         except Exception as e:
             logger.error(f"Failed to initialize Chrome driver: {e}")
-            return False
-    
-    def _wait_for_page_load(self, timeout=PAGE_LOAD_TIMEOUT):
-        """Wait for page to fully load"""
-        try:
-            # Wait for basic page structure
-            wait = WebDriverWait(self.driver, timeout)
-            wait.until(lambda driver: driver.execute_script("return document.readyState") == "complete")
             
-            # Additional wait for dynamic content
-            time.sleep(2)
-            return True
+            # Detailed troubleshooting
+            logger.error("Troubleshooting information:")
             
-        except TimeoutException:
-            logger.warning(f"Page load timeout after {timeout} seconds")
+            # Check if chromedriver is accessible
+            try:
+                result = subprocess.run(['chromedriver', '--version'], capture_output=True, text=True, timeout=5)
+                logger.info(f"ChromeDriver version: {result.stdout.strip()}")
+            except Exception as cmd_e:
+                logger.error(f"Cannot run chromedriver command: {cmd_e}")
+            
+            # Check Chrome version
+            try:
+                result = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True, timeout=5)
+                logger.info(f"Chrome version: {result.stdout.strip()}")
+            except Exception as chrome_e:
+                try:
+                    # Try alternative Chrome commands
+                    result = subprocess.run(['chromium-browser', '--version'], capture_output=True, text=True, timeout=5)
+                    logger.info(f"Chromium version: {result.stdout.strip()}")
+                except:
+                    logger.error(f"Cannot run chrome command: {chrome_e}")
+            
             return False
     
     def _is_driver_alive(self):
@@ -208,176 +565,268 @@ class AUSTRACMediaScraperFixed:
         try:
             if self.driver is None:
                 return False
-            # Try to get current URL as a simple health check
             _ = self.driver.current_url
             return True
         except Exception:
             return False
     
-    def _restart_driver(self):
-        """Restart the driver if it becomes unresponsive"""
-        logger.info("Restarting Chrome driver...")
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception as e:
-                logger.warning(f"Error closing old driver: {e}")
+    def _extract_structured_content_for_llm(self, soup: BeautifulSoup) -> str:
+        """Extract and structure content optimally for LLM analysis"""
+        content_parts = []
         
-        self._setup_driver()
-        logger.info("Chrome driver restarted successfully")
+        # Extract headline
+        headline = ""
+        headline_selectors = ['.au-header-heading', 'h1', '.page-title', '.article-title', '.headline']
+        for selector in headline_selectors:
+            elem = soup.select_one(selector)
+            if elem:
+                headline = elem.get_text(strip=True)
+                break
+        
+        if headline:
+            content_parts.append(f"HEADLINE: {headline}")
+        
+        # Extract publication date
+        date_info = ""
+        date_selectors = ['time[datetime]', '.date', '.published-date', '.article-date']
+        for selector in date_selectors:
+            elem = soup.select_one(selector)
+            if elem:
+                date_info = elem.get_text(strip=True)
+                datetime_attr = elem.get('datetime')
+                if datetime_attr:
+                    date_info += f" (ISO: {datetime_attr})"
+                break
+        
+        if date_info:
+            content_parts.append(f"PUBLICATION DATE: {date_info}")
+        
+        # Extract main content with structure preservation
+        main_content = ""
+        content_selectors = ['.body-copy', '.content', '.article-content', '.main-content', 'article']
+        
+        for selector in content_selectors:
+            content_elem = soup.select_one(selector)
+            if content_elem:
+                # Remove unwanted elements
+                for unwanted in content_elem.select('nav, .navigation, .breadcrumb, .share, .tags, .metadata, script, style'):
+                    unwanted.decompose()
+                
+                # Process content with structure
+                structured_content = []
+                
+                # Extract paragraphs
+                paragraphs = content_elem.find_all('p')
+                for i, p in enumerate(paragraphs, 1):
+                    text = p.get_text(strip=True)
+                    if text and len(text) > 10:  # Skip very short paragraphs
+                        structured_content.append(f"PARAGRAPH {i}: {text}")
+                
+                # Extract lists
+                lists = content_elem.find_all(['ul', 'ol'])
+                for list_num, list_elem in enumerate(lists, 1):
+                    list_items = list_elem.find_all('li')
+                    if list_items:
+                        structured_content.append(f"LIST {list_num}:")
+                        for item_num, item in enumerate(list_items, 1):
+                            item_text = item.get_text(strip=True)
+                            if item_text:
+                                structured_content.append(f"  - ITEM {item_num}: {item_text}")
+                
+                # Extract tables
+                tables = content_elem.find_all('table')
+                for table_num, table in enumerate(tables, 1):
+                    structured_content.append(f"TABLE {table_num}:")
+                    rows = table.find_all('tr')
+                    for row_num, row in enumerate(rows, 1):
+                        cells = row.find_all(['td', 'th'])
+                        if cells:
+                            cell_texts = [cell.get_text(strip=True) for cell in cells]
+                            structured_content.append(f"  ROW {row_num}: {' | '.join(cell_texts)}")
+                
+                main_content = "\n".join(structured_content)
+                break
+        
+        if main_content:
+            content_parts.append(f"MAIN CONTENT:\n{main_content}")
+        
+        # Combine all parts
+        final_content = "\n\n".join(content_parts)
+        return DocumentProcessor.clean_text_for_llm(final_content)
     
-    def _parse_date(self, date_str: str) -> Optional[datetime]:
-        """Parse various date formats from AUSTRAC website"""
-        try:
-            # Clean the date string
-            date_str = date_str.strip()
+    def _find_and_extract_documents(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
+        """Find and extract content from linked PDFs and Excel/CSV files"""
+        documents = []
+        
+        # Find all links
+        links = soup.find_all('a', href=True)
+        
+        for link in links:
+            href = link['href']
             
-            # Try multiple date formats
-            date_formats = [
-                "%d %B %Y",      # 24 June 2025
-                "%d %b %Y",      # 24 Jun 2025  
-                "%B %d, %Y",     # June 24, 2025
-                "%b %d, %Y",     # Jun 24, 2025
-                "%Y-%m-%d",      # 2025-06-24
-                "%d/%m/%Y",      # 24/06/2025
-                "%m/%d/%Y"       # 06/24/2025
-            ]
+            # Make absolute URL
+            if href.startswith('/'):
+                full_url = urljoin(self.base_url, href)
+            elif not href.startswith('http'):
+                full_url = urljoin(base_url, href)
+            else:
+                full_url = href
             
-            for fmt in date_formats:
-                try:
-                    return datetime.strptime(date_str, fmt)
-                except ValueError:
+            # Check file extension
+            parsed_url = urlparse(full_url)
+            file_path = parsed_url.path.lower()
+            
+            if file_path.endswith('.pdf'):
+                logger.info(f"Found PDF: {full_url}")
+                pdf_result = self.doc_processor.extract_pdf_content(full_url)
+                if pdf_result['success']:
+                    documents.append({
+                        'type': 'PDF',
+                        'url': full_url,
+                        'link_text': link.get_text(strip=True),
+                        'content': pdf_result['text_content'],
+                        'metadata': pdf_result['metadata'],
+                        'file_size_mb': pdf_result['file_size_mb'],
+                        'page_count': pdf_result['page_count']
+                    })
+                else:
+                    logger.warning(f"Failed to extract PDF {full_url}: {pdf_result.get('error')}")
+            
+            elif file_path.endswith(('.xlsx', '.xls', '.csv')):
+                logger.info(f"Found spreadsheet: {full_url}")
+                excel_result = self.doc_processor.extract_excel_content(full_url)
+                if excel_result['success']:
+                    documents.append({
+                        'type': 'SPREADSHEET',
+                        'url': full_url,
+                        'link_text': link.get_text(strip=True),
+                        'content': excel_result['text_content'],
+                        'sheet_data': excel_result['sheet_data'],
+                        'metadata': excel_result['metadata'],
+                        'file_size_mb': excel_result['file_size_mb']
+                    })
+                else:
+                    logger.warning(f"Failed to extract spreadsheet {full_url}: {excel_result.get('error')}")
+        
+        return documents
+    
+    def _find_contextual_links(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
+        """Find links within textual content only (p, ul, li, etc.) - excludes navigation links"""
+        contextual_links = []
+        
+        # Only look for links within content elements
+        content_selectors = ['.body-copy', '.content', '.article-content', '.main-content', 'article']
+        content_container = None
+        
+        for selector in content_selectors:
+            content_container = soup.select_one(selector)
+            if content_container:
+                break
+        
+        if not content_container:
+            # Fallback to look in textual elements if no main content found
+            content_container = soup
+        
+        # Find links only within textual elements
+        textual_elements = content_container.find_all(['p', 'ul', 'ol', 'li', 'div', 'span', 'blockquote', 'article'])
+        
+        # Exclude navigation and other non-content areas
+        excluded_classes = [
+            'nav', 'navigation', 'menu', 'breadcrumb', 'share', 'tags', 'metadata', 
+            'header', 'footer', 'sidebar', 'widget', 'social', 'follow', 'subscribe',
+            'contact', 'careers', 'login', 'search'
+        ]
+        
+        excluded_texts = [
+            'skip to', 'careers', 'contact us', 'home', 'business', 'subscribe', 
+            'login', 'register', 'enrol', 'main content', 'austrac online',
+            'new to austrac', 'your industry', 'banking', 'bookmakers'
+        ]
+        
+        for element in textual_elements:
+            # Skip elements that are likely navigation
+            element_classes = ' '.join(element.get('class', [])).lower()
+            if any(excluded in element_classes for excluded in excluded_classes):
+                continue
+            
+            links = element.find_all('a', href=True)
+            for link in links:
+                href = link['href']
+                link_text = link.get_text(strip=True)
+                
+                # Skip empty links or excluded text patterns
+                if not link_text or any(excluded in link_text.lower() for excluded in excluded_texts):
                     continue
-            
-            logger.warning(f"Could not parse date: {date_str}")
-            return None
-            
-        except Exception as e:
-            logger.warning(f"Error parsing date '{date_str}': {e}")
-            return None
-    
-    def _extract_links_from_content(self, content: str) -> List[str]:
-        """Extract all URLs from content text"""
-        try:
-            # Pattern to match URLs
-            url_pattern = r'https?://[^\s<>"\'`|(){}[\]]*[^\s<>"\'`|(){}[\].,;:!?]'
-            urls = re.findall(url_pattern, content)
-            return list(set(urls))  # Remove duplicates
-        except Exception as e:
-            logger.warning(f"Error extracting links: {e}")
-            return []
-    
-    def _clean_text(self, text: str) -> str:
-        """Clean and normalize text content"""
-        if not text:
-            return ""
-        
-        # Remove excessive whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove special characters but keep essential punctuation
-        text = re.sub(r'[^\w\s\.\,\;\:\!\?\-\(\)\[\]\{\}\"\'\/\\\@\#\$\%\&\*\+\=\<\>\~\`]', '', text)
-        # Clean up spacing around punctuation
-        text = re.sub(r'\s+([.!?,:;])', r'\1', text)
-        text = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', text)
-        
-        return text.strip()
-    
-    def _extract_category(self, headline: str) -> str:
-        """Extract category from media release headline"""
-        headline_lower = headline.lower()
-        
-        # Common categories based on AUSTRAC's typical classifications
-        categories = {
-            'enforcement': ['penalty', 'infringement', 'compliance', 'enforcement', 'breach', 'violation', 'fine'],
-            'regulation': ['regulation', 'requirement', 'obligation', 'rule', 'standard', 'consultation'],
-            'guidance': ['guidance', 'update', 'information', 'clarification', 'advice'],
-            'partnership': ['partnership', 'alliance', 'cooperation', 'joint', 'collaboration'],
-            'technology': ['crypto', 'digital', 'technology', 'fintech', 'blockchain', 'bitcoin'],
-            'industry': ['bank', 'casino', 'remitter', 'exchange', 'financial', 'gaming'],
-            'reform': ['reform', 'amendment', 'change', 'new law', 'legislation'],
-            'intelligence': ['intelligence', 'report', 'analysis', 'data', 'suspicious'],
-            'international': ['international', 'global', 'fatf', 'overseas', 'foreign'],
-            'education': ['forum', 'education', 'training', 'workshop', 'seminar']
-        }
-        
-        for category, keywords in categories.items():
-            if any(keyword in headline_lower for keyword in keywords):
-                return category.title()
-        
-        return 'General'
-    
-    def _wait_for_articles(self, timeout=15):
-        """Wait for articles to load on page with multiple selector strategies"""
-        try:
-            wait = WebDriverWait(self.driver, timeout)
-            
-            # Try multiple selectors that might indicate loaded articles
-            selectors_to_try = [
-                ".views-row",
-                ".media-release",
-                ".news-item",
-                ".content-item",
-                "article"
-            ]
-            
-            for selector in selectors_to_try:
-                try:
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    logger.debug(f"Articles loaded with selector: {selector}")
-                    return True
-                except TimeoutException:
+                
+                # Skip anchor links and javascript
+                if href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:'):
                     continue
-            
-            logger.warning("No articles found with any selector")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error waiting for articles: {e}")
-            return False
+                
+                # Make absolute URL
+                if href.startswith('/'):
+                    href = urljoin(self.base_url, href)
+                elif not href.startswith('http'):
+                    href = urljoin(base_url, href)
+                
+                # Skip if same as current page
+                if href == base_url:
+                    continue
+                
+                # Only include if link text seems meaningful (not just navigation)
+                if len(link_text) > 5 and not link_text.lower() in excluded_texts:
+                    contextual_links.append({
+                        'url': href,
+                        'text': link_text,
+                        'domain': urlparse(href).netloc
+                    })
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_links = []
+        for link in contextual_links:
+            if link['url'] not in seen:
+                seen.add(link['url'])
+                unique_links.append(link)
+        
+        return unique_links[:10]  # Limit to first 10 meaningful links
     
     def _extract_articles_from_page(self) -> List[Dict]:
-        """Extract media releases from the current page using multiple selector strategies"""
+        """Extract articles from current page"""
         articles = []
         
         try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             
-            # Strategy 1: Look for the specific selectors from original script
+            # Try multiple selectors for article extraction
             article_elements = soup.select('.views-row')
             
             if not article_elements:
-                # Strategy 2: Look for common media release patterns
                 article_elements = soup.select('article, .media-release, .news-item, .content-item')
             
             if not article_elements:
-                # Strategy 3: Look for any elements with links and dates
+                # Fallback: look for any elements with links and dates
                 article_elements = soup.select('div:has(a):has(time), li:has(a):has(time)')
             
             if not article_elements:
-                # Strategy 4: Look for structured content in lists
+                # Last resort: look for structured content in lists
                 article_elements = soup.select('.view-content > div, .content-list > div, .media-list > div')
             
-            logger.info(f"Found {len(article_elements)} potential media release elements")
+            logger.info(f"Found {len(article_elements)} potential articles")
             
             for element in article_elements:
                 try:
                     article_data = self._parse_media_release_element(element)
                     if article_data:
                         articles.append(article_data)
-                        logger.info(f"📄 Found media release: {article_data.get('headline', 'Unknown')[:100]}...")
-                        
+                        logger.info(f"Extracted article: {article_data['headline'][:100]}...")
                 except Exception as e:
-                    logger.warning(f"Error parsing media release element: {e}")
+                    logger.warning(f"Error parsing article element: {e}")
                     continue
-            
-            # If still no articles, try to extract from text patterns
-            if not articles:
-                articles = self._extract_from_text_patterns(soup)
             
             return articles
             
         except Exception as e:
-            logger.error(f"Error extracting media releases from page: {e}")
+            logger.error(f"Error extracting articles from page: {e}")
             return []
     
     def _parse_media_release_element(self, element) -> Optional[Dict]:
@@ -387,10 +836,10 @@ class AUSTRACMediaScraperFixed:
             headline = None
             url = None
             
-            # Look for headline in various ways
+            # Look for headline
             headline_selectors = [
                 '.views-field-title a',
-                '.field-title a',
+                '.field-title a', 
                 'h1 a, h2 a, h3 a, h4 a, h5 a, h6 a',
                 '.title a',
                 '.headline a',
@@ -430,7 +879,7 @@ class AUSTRACMediaScraperFixed:
             elif not url.startswith('http'):
                 url = self.base_url + '/' + url
             
-            # Extract published date
+            # Extract date
             published_date = "Unknown"
             date_selectors = [
                 '.views-field-field-article-dateline',
@@ -450,287 +899,121 @@ class AUSTRACMediaScraperFixed:
                         published_date = date_elem.get('datetime')
                     break
             
-            # Extract intro/summary text
-            intro_text = ""
-            intro_selectors = [
-                '.views-field-body',
-                '.field-body',
-                '.summary',
-                '.excerpt',
-                '.intro',
-                '.description'
-            ]
-            
-            for selector in intro_selectors:
-                intro_elem = element.select_one(selector)
-                if intro_elem:
-                    intro_text = intro_elem.get_text(strip=True)
-                    break
-            
-            # Generate hash for deduplication
+            # Generate hash
             hash_id = self._generate_hash(url, headline, published_date)
             
-            # Check if already exists
             if hash_id in self.existing_hashes:
-                logger.debug(f"🔄 Skipping existing media release: {headline[:50]}...")
+                logger.debug(f"Skipping existing article: {headline[:50]}...")
                 return None
             
-            article_data = {
+            return {
                 'hash_id': hash_id,
                 'headline': self._clean_text(headline),
                 'url': url,
                 'published_date': published_date,
                 'scraped_date': datetime.now(timezone.utc).isoformat(),
-                'intro_text': self._clean_text(intro_text),
-                'content': '',
-                'related_links': [],
                 'category': self._extract_category(headline)
             }
             
-            return article_data
-            
         except Exception as e:
-            logger.error(f"Error parsing media release element: {e}")
+            logger.error(f"Error parsing element: {e}")
             return None
     
-    def _extract_from_text_patterns(self, soup) -> List[Dict]:
-        """Extract media releases from text patterns when structured elements fail"""
-        articles = []
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text content"""
+        if not text:
+            return ""
         
-        try:
-            # Look for date patterns followed by text
-            text_content = soup.get_text()
-            
-            # Pattern: "DD Month YYYY Title..."
-            date_pattern = r'(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\s+(.+?)(?=\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}|$)'
-            
-            matches = re.findall(date_pattern, text_content, re.DOTALL | re.IGNORECASE)
-            
-            for date_str, content in matches:
-                try:
-                    # Extract headline (first line of content)
-                    lines = content.strip().split('\n')
-                    headline = lines[0].strip() if lines else content[:100].strip()
-                    
-                    if len(headline) < 10:  # Skip very short headlines
-                        continue
-                    
-                    # Clean headline
-                    headline = re.sub(r'\s+', ' ', headline)
-                    headline = headline.split('Read more')[0].strip()  # Remove "Read more" suffix
-                    
-                    # Generate a basic URL (this might need adjustment based on actual URL structure)
-                    url_slug = re.sub(r'[^\w\s-]', '', headline.lower())
-                    url_slug = re.sub(r'\s+', '-', url_slug)[:50]
-                    url = f"{self.base_url}/media-release/{url_slug}"
-                    
-                    # Generate hash for deduplication
-                    hash_id = self._generate_hash(url, headline, date_str)
-                    
-                    # Check if already exists
-                    if hash_id in self.existing_hashes:
-                        continue
-                    
-                    article_data = {
-                        'hash_id': hash_id,
-                        'headline': self._clean_text(headline),
-                        'url': url,
-                        'published_date': date_str.strip(),
-                        'scraped_date': datetime.now(timezone.utc).isoformat(),
-                        'intro_text': self._clean_text(content[:200] + "..."),
-                        'content': '',
-                        'related_links': [],
-                        'category': self._extract_category(headline)
-                    }
-                    
-                    articles.append(article_data)
-                    logger.info(f"📄 Extracted from text: {headline[:100]}...")
-                    
-                except Exception as e:
-                    logger.warning(f"Error parsing text pattern: {e}")
-                    continue
-            
-            return articles
-            
-        except Exception as e:
-            logger.error(f"Error extracting from text patterns: {e}")
-            return []
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep essential punctuation
+        text = re.sub(r'[^\w\s\.\,\;\:\!\?\-\(\)\[\]\{\}\"\'\/\\\@\#\$\%\&\*\+\=\<\>\~\`]', '', text)
+        # Clean up spacing around punctuation
+        text = re.sub(r'\s+([.!?,:;])', r'\1', text)
+        text = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', text)
+        
+        return text.strip()
     
-    def _extract_media_release_content(self, article: Dict) -> Dict:
-        """Extract full content from individual media release page"""
+    def _extract_category(self, headline: str) -> str:
+        """Extract category from headline"""
+        headline_lower = headline.lower()
+        
+        categories = {
+            'enforcement': ['penalty', 'infringement', 'compliance', 'enforcement', 'breach', 'violation', 'fine'],
+            'regulation': ['regulation', 'requirement', 'obligation', 'rule', 'standard', 'consultation'],
+            'guidance': ['guidance', 'update', 'information', 'clarification', 'advice'],
+            'partnership': ['partnership', 'alliance', 'cooperation', 'joint', 'collaboration'],
+            'technology': ['crypto', 'digital', 'technology', 'fintech', 'blockchain', 'bitcoin'],
+            'industry': ['bank', 'casino', 'remitter', 'exchange', 'financial', 'gaming'],
+            'reform': ['reform', 'amendment', 'change', 'new law', 'legislation'],
+            'intelligence': ['intelligence', 'report', 'analysis', 'data', 'suspicious'],
+            'international': ['international', 'global', 'fatf', 'overseas', 'foreign'],
+            'education': ['forum', 'education', 'training', 'workshop', 'seminar']
+        }
+        
+        for category, keywords in categories.items():
+            if any(keyword in headline_lower for keyword in keywords):
+                return category.title()
+        
+        return 'General'
+    
+    def _extract_media_release_content_enhanced(self, article: Dict) -> Dict:
+        """Extract comprehensive content optimized for LLM analysis"""
         try:
-            logger.info(f"🌐 Extracting content for: {article['headline'][:100]}...")
+            logger.info(f"Extracting enhanced content for: {article['headline'][:100]}...")
             
             # Check driver health
             if not self._is_driver_alive():
-                self._restart_driver()
+                logger.warning("Driver not responsive, reinitializing...")
+                if not self._setup_driver():
+                    return article
             
-            # Navigate to article URL
             self.driver.get(article['url'])
-            
-            if not self._wait_for_page_load():
-                logger.warning(f"Page failed to load: {article['url']}")
-                return article
-            
-            time.sleep(random.uniform(1, 2))  # Random delay
-            
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            
-            # Extract headline (might be different from listing page)
-            headline = article['headline']  # Default to existing
-            headline_selectors = ['.au-header-heading', 'h1', '.page-title', '.article-title', '.headline']
-            
-            for selector in headline_selectors:
-                headline_elem = soup.select_one(selector)
-                if headline_elem:
-                    headline = headline_elem.get_text(strip=True)
-                    break
-            
-            # Extract published date (might be more detailed)
-            published_date = article['published_date']  # Default to existing
-            datetime_str = None
-            
-            date_selectors = ['time[datetime]', '.date', '.published-date', '.article-date']
-            for selector in date_selectors:
-                date_elem = soup.select_one(selector)
-                if date_elem:
-                    published_date = date_elem.get_text(strip=True)
-                    datetime_str = date_elem.get('datetime')
-                    break
-            
-            # Extract main content using multiple strategies
-            content = ""
-            content_selectors = [
-                '.body-copy',
-                '.content',
-                '.article-content', 
-                '.main-content',
-                'article',
-                '.page-content',
-                '.entry-content'
-            ]
-            
-            for selector in content_selectors:
-                content_elem = soup.select_one(selector)
-                if content_elem:
-                    # Remove navigation and other non-content elements
-                    for unwanted in content_elem.select('nav, .navigation, .breadcrumb, .share, .tags, .metadata'):
-                        unwanted.decompose()
-                    
-                    content = content_elem.get_text(separator='\n', strip=True)
-                    break
-            
-            if not content:
-                # Fallback: get all text from body
-                body = soup.select_one('body')
-                if body:
-                    content = body.get_text(separator='\n', strip=True)
-            
-            # Clean content
-            content = self._clean_text(content)
-            
-            # Extract related links from content
-            related_links = []
-            if content:
-                related_links = self._extract_links_from_content(content)
-            
-            # Also extract links from the article body HTML
-            content_elem = soup.select_one('.body-copy, .content, .article-content')
-            if content_elem:
-                for link in content_elem.find_all('a', href=True):
-                    href = link['href']
-                    if href.startswith('http'):
-                        related_links.append(href)
-                    elif href.startswith('/'):
-                        related_links.append(self.base_url + href)
-            
-            # Remove duplicates
-            related_links = list(set(related_links))
-            
-            # Update article with extracted content
-            article['headline'] = headline
-            article['published_date'] = published_date
-            article['datetime'] = datetime_str
-            article['content'] = content
-            article['related_links'] = related_links
-            
-            if content:
-                logger.info(f"✅ Content extracted: {len(content)} characters")
-            else:
-                logger.warning(f"⚠️ No content extracted for: {article['headline'][:50]}...")
-            
-            return article
-            
-        except Exception as e:
-            logger.error(f"Error extracting content for {article['url']}: {e}")
-            return article
-    
-    def _scrape_page(self, page_num: int = 0) -> List[Dict]:
-        """Scrape media releases from a specific page"""
-        try:
-            if page_num > 0:
-                url = f"{self.target_url}?page={page_num}"
-            else:
-                url = self.target_url
-            
-            logger.info(f"📄 Scraping page: {url}")
-            
-            # Check driver health
-            if not self._is_driver_alive():
-                self._restart_driver()
-            
-            self.driver.get(url)
-            
-            if not self._wait_for_page_load():
-                logger.error(f"Failed to load page: {url}")
-                return []
-            
-            # Wait for articles to load
-            if not self._wait_for_articles():
-                logger.warning(f"No articles found on page {page_num + 1}")
-                return []
-            
-            # Random delay to appear more human
             time.sleep(random.uniform(2, 4))
             
-            # Extract articles from current page
-            articles = self._extract_articles_from_page()
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                # Additional wait for dynamic content
+                time.sleep(2)
+            except TimeoutException:
+                logger.warning("Page load timeout")
             
-            logger.info(f"Found {len(articles)} media releases on page {page_num + 1}")
-            return articles
-            
-        except Exception as e:
-            logger.error(f"Error scraping page {page_num + 1}: {e}")
-            return []
-    
-    def _check_pagination(self) -> bool:
-        """Check if there are more pages to scrape"""
-        try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             
-            # Look for pagination indicators
-            pagination_selectors = [
-                '.pager__item--next',
-                '.pagination .next',
-                'a[rel="next"]',
-                '.next-page'
-            ]
+            # Extract structured content for LLM
+            structured_content = self._extract_structured_content_for_llm(soup)
             
-            for selector in pagination_selectors:
-                next_link = soup.select_one(selector)
-                if next_link and not next_link.get('disabled'):
-                    return True
+            # Extract linked documents
+            linked_documents = self._find_and_extract_documents(soup, article['url'])
             
-            return False
+            # Extract contextual links from content only
+            contextual_links = self._find_contextual_links(soup, article['url'])
+            
+            # Update article with enhanced content
+            article['structured_content'] = structured_content
+            article['linked_documents'] = linked_documents
+            article['contextual_links'] = contextual_links
+            article['document_count'] = len(linked_documents)
+            article['total_content_length'] = len(structured_content) + sum(len(doc.get('content', '')) for doc in linked_documents)
+            
+            if structured_content:
+                logger.info(f"Enhanced extraction complete: {article['total_content_length']} total characters, {len(linked_documents)} documents")
+            else:
+                logger.warning(f"No content extracted for: {article['headline'][:50]}...")
+            
+            return article
             
         except Exception as e:
-            logger.error(f"Error checking pagination: {e}")
-            return False
-    
+            logger.error(f"Error in enhanced extraction for {article['url']}: {e}")
+            return article
+
     def scrape_media_releases(self) -> List[Dict]:
-        """Main scraping method"""
+        """Main scraping method with enhanced content extraction"""
         logger.info("="*80)
-        logger.info("🚀 Starting AUSTRAC Media Releases scraping")
+        logger.info("Starting AUSTRAC enhanced scraping with LLM-optimized extraction")
         logger.info("="*80)
         
         if not self._setup_driver():
@@ -743,51 +1026,128 @@ class AUSTRACMediaScraperFixed:
             max_empty_pages = 3
             
             while consecutive_empty_pages < max_empty_pages and page_num < MAX_PAGES and not shutdown_requested:
-                logger.info(f"Processing page {page_num + 1}")
+                if page_num > 0:
+                    url = f"{self.target_url}?page={page_num}"
+                else:
+                    url = self.target_url
                 
-                page_articles = self._scrape_page(page_num)
+                logger.info(f"Scraping page {page_num + 1}: {url}")
+                
+                # Check driver health
+                if not self._is_driver_alive():
+                    logger.warning("Driver not responsive, reinitializing...")
+                    if not self._setup_driver():
+                        break
+                
+                self.driver.get(url)
+                
+                # Wait for page to load
+                try:
+                    WebDriverWait(self.driver, 15).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(random.uniform(2, 4))
+                except TimeoutException:
+                    logger.warning("Page load timeout")
+                
+                # Wait for articles to load
+                try:
+                    wait = WebDriverWait(self.driver, 15)
+                    selectors_to_try = [
+                        ".views-row",
+                        ".media-release",
+                        ".news-item",
+                        ".content-item",
+                        "article"
+                    ]
+                    
+                    articles_loaded = False
+                    for selector in selectors_to_try:
+                        try:
+                            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                            logger.debug(f"Articles loaded with selector: {selector}")
+                            articles_loaded = True
+                            break
+                        except TimeoutException:
+                            continue
+                    
+                    if not articles_loaded:
+                        logger.warning("No articles found with any selector")
+                
+                except TimeoutException:
+                    logger.warning("Timeout waiting for articles to load")
+                
+                page_articles = self._extract_articles_from_page()
                 
                 if not page_articles:
                     consecutive_empty_pages += 1
-                    logger.info(f"Empty page encountered ({consecutive_empty_pages}/{max_empty_pages})")
+                    logger.info(f"Empty page ({consecutive_empty_pages}/{max_empty_pages})")
                 else:
                     consecutive_empty_pages = 0
                     all_articles.extend(page_articles)
+                    logger.info(f"Found {len(page_articles)} articles on page {page_num + 1}")
                 
                 # Check if there are more pages
-                if not self._check_pagination():
-                    logger.info("No more pages to scrape")
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                pagination_selectors = [
+                    '.pager__item--next',
+                    '.pagination .next',
+                    'a[rel="next"]',
+                    '.next-page'
+                ]
+                
+                has_next_page = False
+                for selector in pagination_selectors:
+                    next_link = soup.select_one(selector)
+                    if next_link and not next_link.get('disabled'):
+                        has_next_page = True
+                        break
+                
+                if not has_next_page:
+                    logger.info("No more pages found")
                     break
                 
                 page_num += 1
-                
-                # Add delay between pages
                 time.sleep(random.uniform(2, 4))
             
             if not all_articles:
-                logger.info("No new media releases found")
+                logger.info("No new articles found")
                 return []
             
-            logger.info(f"Found {len(all_articles)} new media releases")
-            logger.info("="*80)
-            logger.info("📄 Processing content extraction...")
-            logger.info("="*80)
+            logger.info(f"Found {len(all_articles)} articles. Starting enhanced content extraction...")
             
-            # Extract detailed content for each media release
+            # Enhanced content extraction for each article
             enriched_articles = []
             for i, article in enumerate(all_articles):
                 if shutdown_requested:
                     break
                 
-                logger.info(f"Processing media release {i+1}/{len(all_articles)}")
-                enriched_article = self._extract_media_release_content(article)
-                enriched_articles.append(enriched_article)
+                logger.info(f"Processing article {i+1}/{len(all_articles)}: {article['headline'][:80]}...")
                 
-                # Add delay between requests
+                try:
+                    enriched_article = self._extract_media_release_content_enhanced(article)
+                    enriched_articles.append(enriched_article)
+                    
+                    # Log extraction results
+                    total_chars = enriched_article.get('total_content_length', 0)
+                    doc_count = enriched_article.get('document_count', 0)
+                    logger.info(f"  Content: {total_chars:,} chars, Documents: {doc_count}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing article {i+1}: {e}")
+                    enriched_articles.append(article)  # Add original if enhancement fails
+                
                 time.sleep(random.uniform(2, 4))
             
             logger.info("="*80)
-            logger.info(f"✅ Successfully processed {len(enriched_articles)} media releases")
+            logger.info(f"Enhanced extraction complete: {len(enriched_articles)} articles processed")
+            
+            # Calculate summary
+            total_documents = sum(article.get('document_count', 0) for article in enriched_articles)
+            total_content = sum(article.get('total_content_length', 0) for article in enriched_articles)
+            
+            logger.info(f"Total linked documents processed: {total_documents}")
+            logger.info(f"Total content extracted: {total_content:,} characters")
             logger.info("="*80)
             
             return enriched_articles
@@ -795,154 +1155,113 @@ class AUSTRACMediaScraperFixed:
         finally:
             if self.driver:
                 self.driver.quit()
-                logger.info("🔒 Browser closed")
-    
-    def _load_existing_articles(self) -> List[Dict]:
-        """Load existing articles from JSON file"""
-        if self.json_file.exists():
-            try:
-                with open(self.json_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading existing articles: {e}")
-        return []
-    
+                logger.info("Browser closed")
+
     def save_articles(self, new_articles: List[Dict]):
-        """Save media releases to JSON and CSV files"""
+        """Save articles to JSON only (optimized for LLM analysis)"""
         if not new_articles:
-            logger.info("No new media releases to save")
+            logger.info("No new articles to save")
             return
         
         # Load existing data
-        existing_articles = self._load_existing_articles()
+        existing_articles = []
+        if self.json_file.exists():
+            try:
+                with open(self.json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # Handle both old format (list) and new format (dict with articles key)
+                    if isinstance(data, list):
+                        existing_articles = data
+                    else:
+                        existing_articles = data.get('articles', [])
+            except Exception as e:
+                logger.error(f"Error loading existing data: {e}")
         
-        # Create a set of existing hash_ids for faster lookup
+        # Filter truly new articles
         existing_hash_ids = {article.get('hash_id', '') for article in existing_articles}
+        actually_new = [article for article in new_articles 
+                       if article.get('hash_id', '') not in existing_hash_ids]
         
-        # Filter out truly new articles
-        actually_new_articles = []
-        for article in new_articles:
-            if article.get('hash_id', '') not in existing_hash_ids:
-                actually_new_articles.append(article)
-            else:
-                logger.debug(f"Skipping duplicate: {article.get('headline', 'Unknown')}")
-        
-        if not actually_new_articles:
-            logger.info("No genuinely new media releases found - all were duplicates")
+        if not actually_new:
+            logger.info("No genuinely new articles - all were duplicates")
             return
         
-        # Merge new articles with existing
-        all_articles = existing_articles + actually_new_articles
-        
-        # Sort by scraped_date (most recent first)
+        # Merge and sort
+        all_articles = existing_articles + actually_new
         try:
             all_articles.sort(key=lambda x: x.get('scraped_date', ''), reverse=True)
         except Exception as e:
             logger.warning(f"Could not sort by date: {e}")
         
-        # Save to JSON
+        # Save enhanced JSON structure (no statistics or analysis)
+        output_data = {
+            'metadata': {
+                'last_updated': datetime.now(timezone.utc).isoformat(),
+                'total_articles': len(all_articles),
+                'new_articles_added': len(actually_new),
+                'extraction_capabilities': {
+                    'pdf_extraction': HAS_PYMUPDF or HAS_PDFPLUMBER or HAS_PYPDF2,
+                    'excel_extraction': HAS_OPENPYXL and HAS_PANDAS,
+                    'structured_content': True,
+                    'llm_optimized': True
+                }
+            },
+            'articles': all_articles
+        }
+        
         try:
             with open(self.json_file, 'w', encoding='utf-8') as f:
-                json.dump(all_articles, f, indent=2, ensure_ascii=False)
-            logger.info(f"💾 Saved {len(all_articles)} total media releases to {self.json_file}")
-            logger.info(f"➕ Added {len(actually_new_articles)} new media releases")
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Saved {len(all_articles)} total articles to {self.json_file}")
+            logger.info(f"Added {len(actually_new)} new articles")
+            
+            # Log summary of new additions (no statistics)
+            if actually_new:
+                logger.info("NEW ARTICLES ADDED:")
+                for article in actually_new:
+                    doc_count = article.get('document_count', 0)
+                    content_len = article.get('total_content_length', 0)
+                    logger.info(f"  • {article.get('category', 'General')}: {article.get('headline', 'No title')[:80]}...")
+                    if doc_count > 0:
+                        logger.info(f"    Documents: {doc_count}, Content: {content_len:,} chars")
+            
         except Exception as e:
-            logger.error(f"Error saving JSON file: {e}")
-        
-        # Save to CSV
-        if all_articles:
-            try:
-                fieldnames = [
-                    'hash_id', 'headline', 'url', 'published_date', 
-                    'scraped_date', 'intro_text', 'content', 'related_links', 'category'
-                ]
-                
-                df = pd.DataFrame(all_articles)
-                
-                # Ensure all required columns exist
-                for col in fieldnames:
-                    if col not in df.columns:
-                        df[col] = ""
-                
-                # Convert lists to strings for CSV
-                if 'related_links' in df.columns:
-                    df['related_links'] = df['related_links'].apply(lambda x: '; '.join(x) if isinstance(x, list) else str(x))
-                
-                df = df[fieldnames]
-                df.to_csv(self.csv_file, index=False, encoding='utf-8')
-                logger.info(f"💾 Saved {len(all_articles)} total media releases to {self.csv_file}")
-            except Exception as e:
-                logger.error(f"Error saving CSV file: {e}")
-        
-        # Log summary of new additions
-        if actually_new_articles:
-            logger.info("="*80)
-            logger.info("📋 NEW MEDIA RELEASES ADDED:")
-            for article in actually_new_articles:
-                logger.info(f"   • {article.get('category', 'Unknown')}: {article.get('headline', 'No title')[:80]}...")
-            logger.info("="*80)
+            logger.error(f"Error saving JSON: {e}")
 
 def main():
     """Main execution function"""
     try:
-        scraper = AUSTRACMediaScraperFixed()
+        scraper = AUSTRACEnhancedScraper()
         
         logger.info("="*80)
-        logger.info("🚀 AUSTRAC MEDIA RELEASES SCRAPER STARTED")
+        logger.info("AUSTRAC ENHANCED SCRAPER STARTED")
+        logger.info("Features: LLM-optimized content, PDF/Excel extraction, structured output")
         logger.info("="*80)
         
         new_articles = scraper.scrape_media_releases()
         
         if new_articles:
-            logger.info(f"✅ Successfully scraped {len(new_articles)} media releases")
             scraper.save_articles(new_articles)
             
-            # Summary statistics
-            categories = {}
-            content_count = 0
-            total_content_chars = 0
-            
-            for article in new_articles:
-                category = article.get('category', 'Unknown')
-                categories[category] = categories.get(category, 0) + 1
-                
-                content = article.get('content', '')
-                if content.strip():
-                    content_count += 1
-                    total_content_chars += len(content)
-            
-            logger.info("="*80)
-            logger.info("📊 SCRAPING SUMMARY:")
-            logger.info(f"   Total media releases found: {len(new_articles)}")
-            logger.info(f"   Media releases with content: {content_count}")
-            if content_count > 0:
-                logger.info(f"   Average content length: {total_content_chars // content_count:,} characters")
-            logger.info("   Categories:")
-            for category, count in sorted(categories.items()):
-                logger.info(f"     - {category}: {count}")
-            logger.info("="*80)
-            
-            # Print final summary
             print("="*60)
-            print("AUSTRAC MEDIA RELEASES SCRAPING SUMMARY")
+            print("AUSTRAC ENHANCED SCRAPING SUMMARY")
             print("="*60)
-            print(f"Total media releases processed: {len(new_articles)}")
-            print(f"Media releases with content: {content_count}")
-            if content_count > 0:
-                print(f"Average content length: {total_content_chars // content_count:,} characters")
-            print("Categories breakdown:")
-            for category, count in sorted(categories.items()):
-                print(f"  - {category}: {count}")
+            print(f"Articles processed: {len(new_articles)}")
+            total_docs = sum(article.get('document_count', 0) for article in new_articles)
+            if total_docs > 0:
+                print(f"Documents extracted: {total_docs}")
+            print("="*60)
+            print(f"Output: {JSON_PATH} (LLM-optimized JSON)")
             print("="*60)
             
         else:
-            logger.info("ℹ️  No new media releases found (all may be existing)")
-            print("INFO: No new media releases found - database is up to date")
+            print("No new articles found - database is up to date")
             
     except KeyboardInterrupt:
-        logger.info("🛑 Scraping interrupted by user")
+        logger.info("Scraping interrupted by user")
     except Exception as e:
-        logger.error(f"💥 Scraping failed: {e}")
+        logger.error(f"Scraping failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise

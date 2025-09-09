@@ -27,7 +27,7 @@ from fake_useragent import UserAgent
 BASE_URL = "https://www.tga.gov.au"
 ARTICLES_URL = f"{BASE_URL}/resources/articles"
 DATA_DIR = "data"
-MAX_PAGES = 2 # Set to higher number for first run, 3 for daily runs
+MAX_PAGES = 1 # Set to higher number for first run, 3 for daily runs
 DELAY_RANGE = (2, 5)  # Random delay between requests
 TIMEOUT = 30
 FORCE_RESCRAPE = False  # Set to True to ignore existing data and rescrape everything

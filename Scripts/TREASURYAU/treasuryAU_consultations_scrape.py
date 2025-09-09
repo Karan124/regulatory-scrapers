@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Treasury AU Consultations Scraper - Complete Version
+Treasury AU Consultations Scraper - Fixed Version with Status Tracking
 Scrapes all consultations from Treasury AU website with comprehensive content extraction
+and proper status update tracking for existing consultations
 """
 
 import requests
@@ -11,6 +12,7 @@ import re
 import time
 import logging
 import io
+import hashlib
 from datetime import datetime
 from urllib.parse import urljoin
 from typing import Dict, List, Optional, Set
@@ -49,7 +51,7 @@ except ImportError as e:
 BASE_URL = "https://treasury.gov.au"
 CONSULTATIONS_URL = "https://treasury.gov.au/consultation"
 DATA_DIR = Path("data")
-MAX_PAGES = 3  # Set to None for first run to scrape all pages
+MAX_PAGES = 2  # Set to None for first run to scrape all pages
 DELAY_BETWEEN_REQUESTS = 2
 PDF_TIMEOUT = 30
 MAX_RETRIES = 3
@@ -75,24 +77,39 @@ class Consultation:
     related_links: List[str]
     image_url: Optional[str]
     scraped_date: str
+    # NEW: Track status updates
+    status_history: List[Dict[str, str]]  # List of {status: str, date: str}
+    last_status_check: str
+    unique_id: str
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization"""
         return asdict(self)
 
 class TreasuryAUScraper:
-    """Main scraper class for Treasury AU consultations"""
+    """Main scraper class for Treasury AU consultations with status tracking"""
 
     def __init__(self):
         self.session = requests.Session()
         self.driver = None
         self.ua = UserAgent()
-        self.scraped_urls: Set[str] = set()
+        # FIXED: Track by unique IDs instead of URLs to allow status updates
+        self.existing_consultation_ids: Set[str] = set()
         self.existing_data: List[Dict] = []
+        self.existing_data_by_id: Dict[str, Dict] = {}  # For quick lookups
         self.setup_logging()
         self.setup_directories()
         self.setup_session()
         self.load_existing_data()
+        
+        # Stats tracking
+        self.stats = {
+            'new_consultations': 0,
+            'updated_consultations': 0,
+            'status_changes': 0,
+            'skipped_no_changes': 0,
+            'errors': 0
+        }
 
     def setup_logging(self):
         """Setup logging configuration"""
@@ -148,14 +165,47 @@ class TreasuryAUScraper:
             self.logger.error(f"Failed to initialize Selenium: {e}")
             return False
 
+    def create_unique_id(self, title: str, url: str) -> str:
+        """Create a unique identifier for deduplication"""
+        # Use title and URL path (not full URL to handle parameter changes)
+        url_path = url.split('?')[0]  # Remove query parameters
+        content = f"{title}_{url_path}"
+        return hashlib.md5(content.encode()).hexdigest()
+
     def load_existing_data(self):
-        """Load existing consultation data to avoid duplicates"""
+        """FIXED: Load existing consultation data to track status changes"""
         if JSON_FILE.exists():
             try:
                 with open(JSON_FILE, 'r', encoding='utf-8') as f:
                     self.existing_data = json.load(f)
-                self.scraped_urls = {item['url'] for item in self.existing_data}
-                self.logger.info(f"Loaded {len(self.existing_data)} existing consultations")
+                
+                # Create lookup structures
+                for item in self.existing_data:
+                    # Handle both old and new data formats
+                    if 'unique_id' not in item:
+                        # Create unique ID for existing records
+                        item['unique_id'] = self.create_unique_id(
+                            item.get('title', ''), 
+                            item.get('url', '')
+                        )
+                    
+                    # Ensure status_history exists
+                    if 'status_history' not in item:
+                        item['status_history'] = [{
+                            'status': item.get('status', 'Unknown'),
+                            'date': item.get('scraped_date', datetime.now().isoformat())
+                        }]
+                    
+                    # Ensure last_status_check exists
+                    if 'last_status_check' not in item:
+                        item['last_status_check'] = item.get('scraped_date', datetime.now().isoformat())
+                    
+                    unique_id = item['unique_id']
+                    self.existing_consultation_ids.add(unique_id)
+                    self.existing_data_by_id[unique_id] = item
+                
+                self.logger.info(f"Loaded {len(self.existing_data)} existing consultations with {len(self.existing_consultation_ids)} unique IDs")
+                
             except Exception as e:
                 self.logger.error(f"Error loading existing data: {e}")
                 self.existing_data = []
@@ -278,9 +328,13 @@ class TreasuryAUScraper:
 
                     # Extract consultation ID from URL
                     consultation_id = relative_url.split('/')[-1] if relative_url else ''
+                    
+                    # Create unique ID
+                    unique_id = self.create_unique_id(title, full_url)
 
                     consultations.append({
                         'id': consultation_id,
+                        'unique_id': unique_id,
                         'url': full_url,
                         'title': title,
                         'status': status,
@@ -296,13 +350,57 @@ class TreasuryAUScraper:
 
         return consultations
 
-    def extract_consultation_details(self, consultation_info: Dict) -> Optional[Consultation]:
-        """Extract detailed information from consultation page"""
-        url = consultation_info['url']
+    def check_if_needs_update(self, consultation_info: Dict) -> tuple[bool, Optional[Dict]]:
+        """FIXED: Check if consultation needs updating based on status or timing"""
+        unique_id = consultation_info['unique_id']
+        current_status = consultation_info['status']
+        
+        if unique_id not in self.existing_consultation_ids:
+            # New consultation
+            return True, None
+        
+        existing_data = self.existing_data_by_id[unique_id]
+        existing_status = existing_data.get('status', 'Unknown')
+        
+        # Always update if status has changed
+        if current_status != existing_status:
+            self.logger.info(f"Status change detected for '{consultation_info['title']}': {existing_status} -> {current_status}")
+            return True, existing_data
+        
+        # Update periodically even if status hasn't changed (e.g., content might have been updated)
+        last_check = existing_data.get('last_status_check', '')
+        if last_check:
+            try:
+                last_check_date = datetime.fromisoformat(last_check.replace('Z', '+00:00'))
+                days_since_check = (datetime.now() - last_check_date.replace(tzinfo=None)).days
+                
+                # Update open consultations more frequently
+                if current_status.lower() in ['open', 'active']:
+                    if days_since_check >= 1:  # Check open consultations daily
+                        self.logger.info(f"Updating open consultation '{consultation_info['title']}' (last checked {days_since_check} days ago)")
+                        return True, existing_data
+                else:
+                    if days_since_check >= 7:  # Check closed consultations weekly
+                        self.logger.info(f"Periodic update for consultation '{consultation_info['title']}' (last checked {days_since_check} days ago)")
+                        return True, existing_data
+            except Exception as e:
+                self.logger.warning(f"Error parsing last check date: {e}")
+                return True, existing_data  # Update if we can't parse the date
+        
+        return False, existing_data
 
-        # Check if already scraped
-        if url in self.scraped_urls:
-            self.logger.info(f"Skipping already scraped consultation: {consultation_info['title']}")
+    def extract_consultation_details(self, consultation_info: Dict) -> Optional[Consultation]:
+        """FIXED: Extract detailed information with status tracking"""
+        unique_id = consultation_info['unique_id']
+        url = consultation_info['url']
+        current_status = consultation_info['status']
+        
+        # Check if we need to update this consultation
+        needs_update, existing_data = self.check_if_needs_update(consultation_info)
+        
+        if not needs_update:
+            self.logger.info(f"Skipping consultation (no changes needed): {consultation_info['title']}")
+            self.stats['skipped_no_changes'] += 1
             return None
 
         self.logger.info(f"Scraping consultation: {consultation_info['title']}")
@@ -310,51 +408,90 @@ class TreasuryAUScraper:
         soup = self.get_page_content(url)
         if not soup:
             self.logger.error(f"Failed to get content for {url}")
+            self.stats['errors'] += 1
             return None
 
         try:
-            # Extract consultation period
-            consultation_period = self.extract_consultation_period(soup)
+            # Determine if this is an update or new consultation
+            is_update = existing_data is not None
+            
+            if is_update:
+                # Initialize with existing data
+                consultation_data = existing_data.copy()
+                # Update fields that might have changed
+                consultation_data['status'] = current_status
+                consultation_data['date_range'] = consultation_info['date_range']
+                consultation_data['last_status_check'] = datetime.now().isoformat()
+                
+                # Track status changes
+                existing_status = existing_data.get('status', 'Unknown')
+                if current_status != existing_status:
+                    if 'status_history' not in consultation_data:
+                        consultation_data['status_history'] = []
+                    consultation_data['status_history'].append({
+                        'status': current_status,
+                        'date': datetime.now().isoformat()
+                    })
+                    self.stats['status_changes'] += 1
+                
+                self.stats['updated_consultations'] += 1
+                
+                # For significant updates, re-extract content
+                if current_status != existing_status or not consultation_data.get('content'):
+                    self.logger.info("Re-extracting content due to status change or missing content")
+                    # Extract fresh content
+                    consultation_data['consultation_period'] = self.extract_consultation_period(soup)
+                    consultation_data['theme'] = self.extract_theme(soup)
+                    consultation_data['content'] = self.extract_main_content(soup)
+                    consultation_data['related_links'] = self.extract_related_links(soup)
+                    consultation_data['image_url'] = self.extract_image_url(soup)
+                    consultation_data['pdf_content'] = self.extract_pdf_content(soup)
+                    consultation_data['published_date'] = self.extract_published_date(soup)
+                else:
+                    self.logger.info("Keeping existing content (status update only)")
+            else:
+                # New consultation - extract all content
+                consultation_period = self.extract_consultation_period(soup)
+                theme = self.extract_theme(soup)
+                content = self.extract_main_content(soup)
+                related_links = self.extract_related_links(soup)
+                image_url = self.extract_image_url(soup)
+                pdf_content = self.extract_pdf_content(soup)
+                published_date = self.extract_published_date(soup)
+                
+                consultation_data = {
+                    'id': consultation_info['id'],
+                    'unique_id': unique_id,
+                    'url': url,
+                    'title': consultation_info['title'],
+                    'status': current_status,
+                    'date_range': consultation_info['date_range'],
+                    'published_date': published_date,
+                    'consultation_period': consultation_period,
+                    'theme': theme,
+                    'content': content,
+                    'pdf_content': pdf_content,
+                    'related_links': related_links,
+                    'image_url': image_url,
+                    'scraped_date': datetime.now().isoformat(),
+                    'status_history': [{
+                        'status': current_status,
+                        'date': datetime.now().isoformat()
+                    }],
+                    'last_status_check': datetime.now().isoformat()
+                }
+                
+                self.stats['new_consultations'] += 1
 
-            # Extract theme
-            theme = self.extract_theme(soup)
+            # Convert to Consultation object
+            consultation = Consultation(**consultation_data)
 
-            # Extract main content
-            content = self.extract_main_content(soup)
-
-            # Extract related links
-            related_links = self.extract_related_links(soup)
-
-            # Extract image URL
-            image_url = self.extract_image_url(soup)
-
-            # Extract PDF content
-            pdf_content = self.extract_pdf_content(soup)
-
-            # Extract published date
-            published_date = self.extract_published_date(soup)
-
-            consultation = Consultation(
-                id=consultation_info['id'],
-                url=url,
-                title=consultation_info['title'],
-                status=consultation_info['status'],
-                date_range=consultation_info['date_range'],
-                published_date=published_date,
-                consultation_period=consultation_period,
-                theme=theme,
-                content=content,
-                pdf_content=pdf_content,
-                related_links=related_links,
-                image_url=image_url,
-                scraped_date=datetime.now().isoformat()
-            )
-
-            self.logger.info(f"Successfully extracted consultation: {consultation.title}")
+            self.logger.info(f"Successfully {'updated' if is_update else 'extracted'} consultation: {consultation.title}")
             return consultation
 
         except Exception as e:
             self.logger.error(f"Error extracting consultation details from {url}: {e}")
+            self.stats['errors'] += 1
             return None
 
     def extract_consultation_period(self, soup: BeautifulSoup) -> str:
@@ -630,7 +767,7 @@ class TreasuryAUScraper:
             pdf_links = []
 
             # Method 1: Direct PDF links ending with .pdf
-            direct_pdf_links = soup.find_all('a', href=re.compile(r'\.pdf$', re.I))
+            direct_pdf_links = soup.find_all('a', href=re.compile(r'\.pdf', re.I))
             pdf_links.extend(direct_pdf_links)
 
             # Method 2: Links containing .pdf anywhere in href
@@ -899,25 +1036,53 @@ class TreasuryAUScraper:
 
                 time.sleep(DELAY_BETWEEN_REQUESTS)
 
-        self.logger.info(f"Scraped {len(all_consultations)} new consultations")
+        self.logger.info(f"Scraping completed. Found {len(all_consultations)} consultations to save")
         return all_consultations
 
     def save_data(self, consultations: List[Consultation]):
-        """Save scraped data to JSON and CSV files"""
+        """FIXED: Save scraped data with proper merging of updates"""
         try:
-            # Combine with existing data
-            all_data = self.existing_data + [consultation.to_dict() for consultation in consultations]
+            # Create a dictionary of new consultations by unique_id
+            new_consultations_by_id = {c.unique_id: c.to_dict() for c in consultations}
+            
+            # Start with existing data
+            updated_data = []
+            updated_ids = set()
+            
+            # Update existing records with new data
+            for existing_item in self.existing_data:
+                unique_id = existing_item.get('unique_id')
+                if unique_id in new_consultations_by_id:
+                    # Use updated data
+                    updated_data.append(new_consultations_by_id[unique_id])
+                    updated_ids.add(unique_id)
+                else:
+                    # Keep existing data
+                    updated_data.append(existing_item)
+            
+            # Add completely new consultations
+            for unique_id, consultation_data in new_consultations_by_id.items():
+                if unique_id not in updated_ids:
+                    updated_data.append(consultation_data)
 
             # Save JSON
             with open(JSON_FILE, 'w', encoding='utf-8') as f:
-                json.dump(all_data, f, ensure_ascii=False, indent=2)
+                json.dump(updated_data, f, ensure_ascii=False, indent=2)
 
             # Save CSV
-            if all_data:
-                df = pd.DataFrame(all_data)
+            if updated_data:
+                df = pd.DataFrame(updated_data)
                 df.to_csv(CSV_FILE, index=False, encoding='utf-8')
 
-            self.logger.info(f"Saved {len(all_data)} consultations to {JSON_FILE} and {CSV_FILE}")
+            self.logger.info(f"Saved {len(updated_data)} total consultations to {JSON_FILE} and {CSV_FILE}")
+            
+            # Log statistics
+            self.logger.info("=== SCRAPING STATISTICS ===")
+            self.logger.info(f"New consultations: {self.stats['new_consultations']}")
+            self.logger.info(f"Updated consultations: {self.stats['updated_consultations']}")
+            self.logger.info(f"Status changes detected: {self.stats['status_changes']}")
+            self.logger.info(f"Skipped (no changes): {self.stats['skipped_no_changes']}")
+            self.logger.info(f"Errors: {self.stats['errors']}")
 
         except Exception as e:
             self.logger.error(f"Error saving data: {e}")
@@ -934,16 +1099,16 @@ class TreasuryAUScraper:
     def run(self):
         """Main run method"""
         try:
-            self.logger.info("=== Starting Treasury AU Scraper ===")
+            self.logger.info("=== Starting Treasury AU Scraper with Status Tracking ===")
 
             consultations = self.scrape_consultations()
-            self.logger.info(f"Scraping completed. Found {len(consultations)} consultations")
+            self.logger.info(f"Scraping completed. Found {len(consultations)} consultations to process")
 
             if consultations:
                 self.save_data(consultations)
                 self.logger.info("Data saved successfully")
             else:
-                self.logger.warning("No new consultations found")
+                self.logger.warning("No consultations found to update")
 
         except Exception as e:
             self.logger.error(f"Error in main run: {e}")

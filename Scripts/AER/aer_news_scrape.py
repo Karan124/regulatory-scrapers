@@ -1,1046 +1,797 @@
 #!/usr/bin/env python3
 """
-AER News Scraper
-Scrapes news articles from Australian Energy Regulator website
-
-Requirements:
-pip install requests beautifulsoup4 fake-useragent PyPDF2 lxml selenium
+Enhanced AER News Scraper for LLM Analysis
+------------------------------------------
+Comprehensive scraper that extracts all content types, embedded files,
+and related resources with proper categorization and error handling.
 """
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
 import json
-import csv
 import os
 import time
 import logging
-from datetime import datetime
 import re
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
+from typing import Optional, List, Dict, Set
 import random
-from fake_useragent import UserAgent
-import PyPDF2
-import io
+import requests
+from bs4 import BeautifulSoup
+import hashlib
+
+# Import Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
-class AERScraper:
-    def __init__(self, max_pages=3):
-        """Initialize the scraper with configuration"""
+# File processing imports
+try:
+    import PyPDF2
+    import io
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    print("WARNING: PyPDF2 not found. PDF extraction will be disabled. Run: pip install PyPDF2")
+
+try:
+    import pandas as pd
+    import openpyxl
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+    print("WARNING: pandas/openpyxl not found. Excel/CSV extraction will be disabled. Run: pip install pandas openpyxl")
+
+
+class EnhancedAERNewsScraper:
+    """Comprehensive AER news scraper with enhanced content extraction and categorization"""
+    
+    def __init__(self, max_pages: int = 3):
         self.BASE_URL = "https://www.aer.gov.au"
         self.NEWS_URL = "https://www.aer.gov.au/news/articles"
-        self.MAX_PAGES = max_pages
-        self.DATA_DIR = "data"
-        self.JSON_FILE = os.path.join(self.DATA_DIR, "aer_all_news.json")
-        self.CSV_FILE = os.path.join(self.DATA_DIR, "aer_all_news.csv")
-        self.LOG_FILE = os.path.join(self.DATA_DIR, "aer_scraper.log")
         
-        # Create data directory if it doesn't exist
+        self.DATA_DIR = "data"
+        self.JSON_FILE = os.path.join(self.DATA_DIR, "aer_news.json")
+        
+        # Create data directory
         os.makedirs(self.DATA_DIR, exist_ok=True)
         
-        # Setup logging
+        # Smart MAX_PAGES logic with better handling
+        if max_pages is None:
+            is_first_run = not os.path.exists(self.JSON_FILE)
+            self.MAX_PAGES = 300 if is_first_run else 5
+            run_type = "First Run" if is_first_run else "Daily Update"
+            print(f"INFO: Detected '{run_type}'. Setting MAX_PAGES to {self.MAX_PAGES}.")
+        else:
+            self.MAX_PAGES = max_pages
+        
         self.setup_logging()
         
-        # Initialize session with stealth capabilities
-        self.session = self.create_stealth_session()
-        
-        # Initialize Selenium driver for JavaScript-heavy pages (optional)
         self.driver = None
-        self._selenium_available = self._check_selenium_availability()
-        
-        if not self._selenium_available:
-            self.logger.info("Selenium not available - will use requests-only mode")
-        
-        # Load existing data for deduplication
+        self.session = requests.Session()
         self.existing_articles = self.load_existing_data()
+        self.processed_files: Set[str] = set()
+        self.session_retry_count = 0
+        self.max_session_retries = 3
         
-        self.logger.info(f"Initialized AER Scraper - Max pages: {self.MAX_PAGES}")
-
-    def _check_selenium_availability(self):
-        """Check if Selenium can be used"""
-        try:
-            import shutil
-            
-            # Check for Chrome/Chromium
-            chrome_paths = [
-                '/usr/bin/google-chrome',
-                '/usr/bin/chrome', 
-                '/usr/bin/chromium-browser',
-                '/usr/bin/chromium',
-                '/snap/bin/chromium'
-            ]
-            
-            chrome_found = any(shutil.which(path) for path in chrome_paths)
-            
-            if not chrome_found:
-                self.logger.info("No Chrome/Chromium browser found. To install:")
-                self.logger.info("Ubuntu/Debian: sudo apt-get install chromium-browser")
-                self.logger.info("Or: sudo apt-get install google-chrome-stable")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            self.logger.debug(f"Selenium availability check failed: {e}")
-            return False
+        self.setup_session()
+        self.logger.info(f"Enhanced AER News Scraper initialized. Max pages to scrape: {self.MAX_PAGES}")
 
     def setup_logging(self):
-        """Setup logging configuration"""
+        """Setup console-only logging"""
+        log_format = '%(asctime)s - %(levelname)s - %(message)s'
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
+            format=log_format,
             handlers=[
-                logging.FileHandler(self.LOG_FILE),
                 logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
 
-    def create_stealth_session(self):
-        """Create a session with enhanced stealth capabilities"""
-        session = requests.Session()
-        
-        # Setup retry strategy
-        retry_strategy = Retry(
-            total=5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"],
-            backoff_factor=2
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
-        # Setup comprehensive headers to mimic real browser
-        ua = UserAgent()
-        session.headers.update({
-            'User-Agent': ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9,en-AU;q=0.8',
+    def setup_session(self):
+        """Setup session with realistic browser headers and better retry handling"""
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-            'sec-ch-ua': '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Linux"'
+            'Upgrade-Insecure-Requests': '1'
         })
-        
-        return session
 
-    def init_selenium_driver(self):
-        """Initialize Selenium driver with stealth options"""
-        if self.driver is None:
-            try:
-                # Try multiple approaches to get ChromeDriver working
-                options = Options()
-                options.add_argument('--headless')
-                options.add_argument('--no-sandbox')
-                options.add_argument('--disable-dev-shm-usage')
-                options.add_argument('--disable-blink-features=AutomationControlled')
-                options.add_argument('--disable-web-security')
-                options.add_argument('--allow-running-insecure-content')
-                options.add_argument('--disable-features=VizDisplayCompositor')
-                options.add_argument('--disable-gpu')
-                options.add_argument('--remote-debugging-port=9222')
-                options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                options.add_experimental_option('useAutomationExtension', False)
-                
-                # Add user agent to options
-                try:
-                    ua = UserAgent()
-                    options.add_argument(f'--user-agent={ua.random}')
-                except:
-                    # Fallback if UserAgent fails
-                    options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-                
-                # Try different approaches
-                approaches = [
-                    # Approach 1: Try system chrome
-                    lambda: webdriver.Chrome(options=options),
-                    # Approach 2: Try with explicit service
-                    lambda: self._try_chrome_with_service(options),
-                    # Approach 3: Try chromium
-                    lambda: self._try_chromium(options)
-                ]
-                
-                for i, approach in enumerate(approaches):
-                    try:
-                        self.driver = approach()
-                        if self.driver:
-                            # Execute script to hide webdriver property
-                            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                            self.logger.info(f"Selenium driver initialized successfully using approach {i+1}")
-                            return
-                    except Exception as approach_error:
-                        self.logger.debug(f"Approach {i+1} failed: {approach_error}")
-                        continue
-                
-                # If all approaches fail, log and continue without Selenium
-                self.logger.warning("All Selenium initialization approaches failed - continuing without Selenium")
-                self.driver = None
-                
-            except Exception as e:
-                self.logger.warning(f"Selenium initialization failed: {e} - continuing without Selenium")
-                self.driver = None
-
-    def _try_chrome_with_service(self, options):
-        """Try Chrome with explicit service"""
-        from selenium.webdriver.chrome.service import Service
-        import shutil
-        
-        # Try to find chrome/chromium binary
-        chrome_paths = [
-            '/usr/bin/google-chrome',
-            '/usr/bin/chrome',
-            '/usr/bin/chromium-browser',
-            '/usr/bin/chromium',
-            '/snap/bin/chromium'
-        ]
-        
-        for chrome_path in chrome_paths:
-            if shutil.which(chrome_path):
-                options.binary_location = chrome_path
-                service = Service()
-                return webdriver.Chrome(service=service, options=options)
-        
-        raise Exception("No Chrome binary found")
-
-    def _try_chromium(self, options):
-        """Try with Chromium"""
-        import shutil
-        
-        chromium_path = shutil.which('chromium-browser') or shutil.which('chromium')
-        if chromium_path:
-            options.binary_location = chromium_path
-            return webdriver.Chrome(options=options)
-        
-        raise Exception("Chromium not found")
-
-    def close_selenium_driver(self):
-        """Close Selenium driver"""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
-
-    def load_existing_data(self):
+    def load_existing_data(self) -> Dict[str, Dict]:
         """Load existing articles for deduplication"""
-        existing_articles = {}
-        
+        existing = {}
         if os.path.exists(self.JSON_FILE):
             try:
                 with open(self.JSON_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for article in data:
-                        # Use URL as unique identifier
-                        existing_articles[article.get('url', '')] = article
-                self.logger.info(f"Loaded {len(existing_articles)} existing articles")
+                        if isinstance(article, dict) and 'url' in article:
+                            existing[article['url']] = article
+                self.logger.info(f"Loaded {len(existing)} existing articles for deduplication.")
             except Exception as e:
                 self.logger.error(f"Error loading existing data: {e}")
-        
-        return existing_articles
+        return existing
 
-    def establish_session(self):
-        """Establish session by visiting main page and collecting cookies"""
+    def _setup_driver(self) -> Optional[webdriver.Chrome]:
+        """Setup Chrome driver with enhanced stability"""
+        options = Options()
+        options.add_argument('--headless=new')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument(f'--user-agent={self.session.headers["User-Agent"]}')
+        
         try:
-            self.logger.info("Establishing session by visiting main page...")
-            
-            # First, visit the main page to collect cookies
-            response = self.session.get(self.BASE_URL)
-            if response.status_code == 200:
-                self.logger.info("Main page visited successfully")
-                time.sleep(random.uniform(2, 4))
-                
-                # Visit the news section to establish browsing pattern
-                news_response = self.session.get(self.NEWS_URL)
-                if news_response.status_code == 200:
-                    self.logger.info("News page visited successfully - session established")
-                    time.sleep(random.uniform(2, 4))
-                    return True
-                else:
-                    self.logger.warning(f"News page returned status {news_response.status_code}")
-            else:
-                self.logger.warning(f"Main page returned status {response.status_code}")
-                
+            service = Service()
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            driver.implicitly_wait(15)
+            driver.set_page_load_timeout(90)
+            return driver
         except Exception as e:
-            self.logger.error(f"Error establishing session: {e}")
-            
-        return False
+            self.logger.error(f"Failed to initialize Chrome driver: {e}")
+            return None
 
-    def get_page_content(self, url, use_selenium=False):
-        """Get page content with retry mechanism and enhanced stealth"""
-        max_retries = 3
+    def establish_session(self) -> bool:
+        """Establish session with improved retry logic"""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+
+        self.driver = self._setup_driver()
+        if not self.driver:
+            return False
         
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Add random delay to avoid being detected
-                time.sleep(random.uniform(2, 5))
+                self.logger.info(f"Session establishment attempt {attempt + 1}/{max_retries}")
                 
-                # Update headers with fresh user agent for this request
-                ua = UserAgent()
-                self.session.headers.update({
-                    'User-Agent': ua.random,
-                    'Referer': self.BASE_URL if attempt == 0 else self.NEWS_URL
-                })
+                self.driver.get(self.BASE_URL)
+                time.sleep(random.uniform(2, 4))
                 
-                if use_selenium and self.driver is None:
-                    self.init_selenium_driver()
+                self.driver.get(self.NEWS_URL)
+                WebDriverWait(self.driver, 45).until(
+                    EC.any_of(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.view-content")),
+                        EC.presence_of_element_located((By.CSS_SELECTOR, ".views-layout__item"))
+                    )
+                )
                 
-                if use_selenium and self.driver:
-                    self.logger.info(f"Using Selenium for {url}")
-                    self.driver.get(url)
-                    time.sleep(random.uniform(3, 6))
-                    content = self.driver.page_source
-                    soup = BeautifulSoup(content, 'html.parser')
-                    
-                    # Check if we got redirected
-                    current_url = self.driver.current_url
-                    if current_url != url:
-                        self.logger.warning(f"Selenium redirected from {url} to {current_url}")
-                    
-                    return soup
-                else:
-                    response = self.session.get(url, timeout=30)
-                    
-                    # Check for redirects
-                    if response.url != url:
-                        self.logger.warning(f"Redirected from {url} to {response.url}")
-                    
-                    if response.status_code == 403:
-                        self.logger.warning(f"403 Forbidden for {url} (attempt {attempt + 1})")
-                        if attempt < max_retries - 1:
-                            # Try with Selenium on next attempt
-                            self.logger.info("Will retry with Selenium...")
-                            time.sleep(random.uniform(10, 15))
-                            return self.get_page_content(url, use_selenium=True)
-                    elif response.status_code == 404:
-                        self.logger.warning(f"404 Not Found for {url} - page may not exist")
-                        return None
-                    elif response.status_code == 200:
-                        soup = BeautifulSoup(response.content, 'html.parser')
-                        
-                        # Check if this looks like an error page or empty results
-                        page_title = soup.title.string if soup.title else ""
-                        if "error" in page_title.lower() or "not found" in page_title.lower():
-                            self.logger.warning(f"Error page detected: {page_title}")
-                            return None
-                            
-                        return soup
-                    else:
-                        self.logger.warning(f"Status {response.status_code} for {url}")
-                        
-            except Exception as e:
-                self.logger.error(f"Attempt {attempt + 1} failed for {url}: {e}")
+                self.logger.info("Session established successfully.")
+                return True
+                
+            except TimeoutException:
+                self.logger.warning(f"Session establishment timeout on attempt {attempt + 1}")
                 if attempt < max_retries - 1:
-                    time.sleep(random.uniform(10, 20))
+                    time.sleep(random.uniform(5, 10))
+                    continue
+            except Exception as e:
+                self.logger.error(f"Session establishment failed on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(random.uniform(5, 10))
+                    continue
         
-        self.logger.error(f"Failed to get content for {url} after {max_retries} attempts")
-        return None
+        self.logger.error("Failed to establish session after all retries")
+        return False
 
-    def extract_pdf_text(self, pdf_url):
-        """Extract text from PDF file"""
-        try:
-            self.logger.info(f"Extracting text from PDF: {pdf_url}")
+    def clean_text_for_llm(self, text: str) -> str:
+        """Clean text to make it maximally LLM-friendly"""
+        if not text:
+            return ""
+        
+        # Remove excessive whitespace and normalize spacing
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(\n\s*)+\n', '\n', text)
+        
+        # Remove special characters that might interfere with JSON or LLM processing
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        
+        # Clean up common HTML entities
+        html_entities = {
+            '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>',
+            '&quot;': '"', '&#39;': "'", '&apos;': "'", '&mdash;': '—',
+            '&ndash;': '–', '&hellip;': '…', '&lsquo;': ''', '&rsquo;': ''',
+            '&ldquo;': '"', '&rdquo;': '"', '&bull;': '•'
+        }
+        for entity, replacement in html_entities.items():
+            text = text.replace(entity, replacement)
+        
+        # Clean up common artifacts
+        unwanted_patterns = [
+            r'Print this page', r'Share this page', r'Download PDF',
+            r'Skip to main content', r'Back to top'
+        ]
+        for pattern in unwanted_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        
+        text = text.strip()
+        if text and not text.endswith(('.', '!', '?', ':', '"', "'")):
+            text += '.'
+        
+        return text
+
+    def extract_pdf_content(self, pdf_url: str) -> str:
+        """Extract complete PDF text with enhanced error handling"""
+        if not PDF_AVAILABLE:
+            return ""
             
-            response = self.session.get(pdf_url, timeout=60)
-            if response.status_code != 200:
-                self.logger.error(f"Failed to download PDF: {response.status_code}")
+        try:
+            pdf_hash = hashlib.md5(pdf_url.encode()).hexdigest()
+            if pdf_hash in self.processed_files:
                 return ""
             
-            pdf_file = io.BytesIO(response.content)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            self.logger.info(f"Extracting PDF: {os.path.basename(pdf_url)}")
             
-            text = ""
-            for page_num in range(len(pdf_reader.pages)):
-                page = pdf_reader.pages[page_num]
+            response = self.session.get(pdf_url, timeout=120)
+            response.raise_for_status()
+            
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(response.content))
+            if len(pdf_reader.pages) == 0:
+                return ""
+            
+            full_text_parts = []
+            for page in pdf_reader.pages:
                 page_text = page.extract_text()
-                text += page_text + "\n"
+                if page_text and page_text.strip():
+                    full_text_parts.append(self.clean_text_for_llm(page_text))
             
-            # Clean up text - remove excessive whitespace and unwanted characters
-            text = re.sub(r'\s+', ' ', text)
-            text = re.sub(r'[^\w\s\.\,\;\:\!\?\-\(\)]', '', text)
-            text = text.strip()
-            
-            self.logger.info(f"Successfully extracted {len(text)} characters from PDF")
-            return text
+            full_text = ' '.join(full_text_parts)
+            self.processed_files.add(pdf_hash)
+            return full_text
             
         except Exception as e:
-            self.logger.error(f"Error extracting PDF text from {pdf_url}: {e}")
+            self.logger.error(f"Error extracting PDF {pdf_url}: {e}")
             return ""
 
-    def extract_links_from_content(self, soup, base_url):
-        """Extract all relevant links from article content"""
-        links = []
+    def extract_excel_csv_content(self, file_url: str) -> str:
+        """Extract content from Excel/CSV files"""
+        if not EXCEL_AVAILABLE:
+            return ""
+            
+        try:
+            file_hash = hashlib.md5(file_url.encode()).hexdigest()
+            if file_hash in self.processed_files:
+                return ""
+
+            self.logger.info(f"Extracting spreadsheet: {os.path.basename(file_url)}")
+            
+            response = self.session.get(file_url, timeout=120)
+            response.raise_for_status()
+            
+            file_extension = os.path.splitext(urlparse(file_url).path)[1].lower()
+            
+            if file_extension == '.csv':
+                df = pd.read_csv(io.BytesIO(response.content), encoding='utf-8')
+            else:
+                df = pd.read_excel(io.BytesIO(response.content), engine='openpyxl')
+
+            content = f"File: {os.path.basename(file_url)}\nColumns: {', '.join(df.columns)}\nRows: {len(df)}\nSample data:\n{df.head(3).to_string(index=False)}"
+            
+            self.processed_files.add(file_hash)
+            return self.clean_text_for_llm(content)
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting spreadsheet {file_url}: {e}")
+            return ""
+
+    def extract_article_type_from_index(self, article_card_soup: BeautifulSoup) -> str:
+        """Extract article type from index page"""
+        try:
+            type_elem = article_card_soup.select_one('div.field--name-field-article-type .field__item')
+            if type_elem:
+                return type_elem.get_text(strip=True)
+        except:
+            pass
+        return ""
+
+    def extract_segments_from_index(self, article_card_soup: BeautifulSoup) -> List[str]:
+        """Extract segments from index page"""
+        segments = []
+        try:
+            segment_items = article_card_soup.select('div.field--name-field-segments .field__item')
+            for item in segment_items:
+                segment = item.get_text(strip=True)
+                if segment:
+                    segments.append(segment)
+        except:
+            pass
+        return segments
+
+    def extract_sectors_from_index(self, article_card_soup: BeautifulSoup) -> List[str]:
+        """Extract sectors from index page"""
+        sectors = []
+        try:
+            if article_card_soup.select_one('.field__item-electricity'):
+                sectors.append('Electricity')
+            if article_card_soup.select_one('.field__item-gas'):
+                sectors.append('Gas')
+        except:
+            pass
+        return sectors
+
+    def extract_all_embedded_links(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract ALL links from article content area - simplified approach"""
+        embedded_links = []
         
-        try:
-            # Find all links in the content area - simple approach
-            content_areas = soup.find_all(['div', 'section', 'article'])
+        # Find the main content area
+        content_area = soup.find('div', class_='field--name-field-body')
+        if not content_area:
+            return embedded_links
+        
+        # Get ALL links within the content area
+        all_links = content_area.find_all('a', href=True)
+        
+        for link in all_links:
+            href = link.get('href', '').strip()
+            if not href:
+                continue
             
-            for area in content_areas:
-                class_list = area.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                # Look for content, body, or main in class names
-                if any(keyword in class_str.lower() for keyword in ['content', 'body', 'main']):
-                    for link in area.find_all('a', href=True):
-                        href = link.get('href')
-                        if href:
-                            full_url = urljoin(base_url, href)
-                            # Filter out navigation and unrelated links
-                            if not any(skip in href.lower() for skip in 
-                                     ['javascript:', 'mailto:', '#', 'tel:']):
-                                links.append({
-                                    'url': full_url,
-                                    'text': link.get_text(strip=True),
-                                    'title': link.get('title', '')
-                                })
+            # Skip only these specific patterns
+            if href.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+                continue
             
-            # Remove duplicates
-            seen_urls = set()
-            unique_links = []
-            for link in links:
-                if link['url'] not in seen_urls:
-                    seen_urls.add(link['url'])
-                    unique_links.append(link)
-            
-            return unique_links[:10]  # Limit to first 10 relevant links
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting links: {e}")
-            return []
-
-    def get_article_links_from_page(self, page_num=0):
-        """Get article links from a specific page"""
-        try:
-            if page_num == 0:
-                url = self.NEWS_URL
+            # Convert relative URLs to absolute
+            if href.startswith('/'):
+                full_url = urljoin(self.BASE_URL, href)
+            elif href.startswith('http'):
+                full_url = href
             else:
-                url = f"{self.NEWS_URL}?page={page_num}"
+                continue
             
-            self.logger.info(f"Fetching article links from page {page_num}: {url}")
-            
-            soup = self.get_page_content(url)
-            if not soup:
-                self.logger.warning(f"Failed to get page content for page {page_num}, trying with Selenium...")
-                soup = self.get_page_content(url, use_selenium=True)
-                if not soup:
-                    self.logger.error(f"Failed to get page {page_num} even with Selenium")
-                    return []
-            
-            # Check if we got a malformed page (no body tag indicates serious issues)
-            body = soup.find('body')
-            if not body:
-                self.logger.warning(f"No body tag found on page {page_num}, likely rate limited or blocked")
-                
-                # Strategy 1: Try refreshing session with longer delay
-                self.logger.info("Strategy 1: Refreshing session and waiting...")
-                self.establish_session()
-                time.sleep(random.uniform(15, 25))  # Longer delay
-                
-                # Update headers to look more human
-                ua = UserAgent()
-                self.session.headers.update({
-                    'User-Agent': ua.random,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
+            link_text = link.get_text(strip=True)
+            if link_text:
+                embedded_links.append({
+                    'url': full_url,
+                    'text': link_text
                 })
-                
-                # Retry with fresh session
-                soup = self.get_page_content(url)
-                if soup and soup.find('body'):
-                    self.logger.info("Session refresh with delay resolved the issue")
-                else:
-                    # Strategy 2: Try Selenium only if available
-                    if self.driver is not None or self.init_selenium_driver():
-                        self.logger.info("Strategy 2: Trying Selenium...")
-                        try:
-                            soup = self.get_page_content(url, use_selenium=True)
-                            if soup and soup.find('body'):
-                                self.logger.info("Selenium resolved the issue")
-                            else:
-                                self.logger.warning(f"Selenium didn't help for page {page_num}")
-                                return []
-                        except Exception as selenium_error:
-                            self.logger.warning(f"Selenium failed: {selenium_error}")
-                            return []
-                    else:
-                        self.logger.warning(f"No Selenium available and session refresh failed for page {page_num}")
-                        return []
+        
+        return embedded_links
+
+    def extract_related_content(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract related content from bottom section"""
+        related_content = []
+        
+        # Find related content section
+        related_section = soup.select_one('section.page__related, .views-element-container.block-views-block-content-related, #block-views-block-content-related')
+        if not related_section:
+            return related_content
+        
+        # Find all card links in related section
+        cards = related_section.select('.card__title a')
+        
+        for card_link in cards:
+            href = card_link.get('href', '').strip()
+            if not href:
+                continue
             
-            # Debug: Save problematic pages for analysis
-            if page_num >= 6:  # Save pages that might be problematic
-                debug_file = os.path.join(self.DATA_DIR, f"debug_page_{page_num}.html")
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(str(soup.prettify()))
-                self.logger.info(f"Saved debug HTML for page {page_num} to {debug_file}")
+            # Convert to absolute URL
+            full_url = urljoin(self.BASE_URL, href) if href.startswith('/') else href
+            title = card_link.get_text(strip=True)
             
-            # Check if this is a valid page by looking for the results header
-            view_header = soup.find('div', class_='view-header')
-            if view_header:
-                header_text = view_header.get_text(strip=True)
-                self.logger.info(f"Page {page_num} header: {header_text}")
-                
-                # Extract pagination info like "3490 result(s), displaying 49 to 60"
-                if 'result(s)' in header_text and 'displaying' in header_text:
-                    self.logger.info(f"Valid results page found: {header_text}")
-                else:
-                    self.logger.warning(f"Unexpected header format: {header_text}")
-            else:
-                self.logger.warning(f"No view-header found on page {page_num}")
-                
-                # Check if we might have been redirected to a different page
-                page_title = soup.title.string if soup.title else ""
-                self.logger.info(f"Page title: {page_title}")
-                
-                # Look for error indicators
-                error_indicators = soup.find_all(string=re.compile(r'error|not found|invalid|access denied', re.I))
-                if error_indicators:
-                    self.logger.warning(f"Error indicators found: {[err.strip() for err in error_indicators[:3]]}")
-                
-                # Check the actual content length
-                page_content = str(soup)
-                self.logger.info(f"Page content length: {len(page_content)} characters")
-                
-                # Look for common error patterns
-                if len(page_content) < 1000:  # Very short page, likely an error
-                    self.logger.warning("Very short page content - likely an error page")
-                    # Log first 500 characters for debugging
-                    self.logger.warning(f"Page content preview: {page_content[:500]}")
-                
-                # Check if page contains any meaningful content
-                body = soup.find('body')
-                if body:
-                    body_text = body.get_text(strip=True)
-                    self.logger.info(f"Body text length: {len(body_text)} characters")
-                    if len(body_text) < 100:
-                        self.logger.warning(f"Very little body text: {body_text[:200]}")
-                else:
-                    self.logger.warning("No body tag found")
-                    
-                # Check for specific AER content indicators
-                aer_indicators = soup.find_all(['div', 'header', 'nav'])
-                aer_count = 0
-                for elem in aer_indicators:
-                    class_list = elem.get('class', [])
-                    class_str = ' '.join(class_list) if class_list else ''
-                    if any(keyword in class_str.lower() for keyword in ['aer', 'header', 'nav']):
-                        aer_count += 1
-                
-                self.logger.info(f"Found {aer_count} AER/header/nav elements")
+            # Get card container for additional metadata
+            card_container = card_link.find_parent('.card__inner') or card_link.find_parent('.views-layout__item')
             
-            article_links = []
+            description = ""
+            content_type = ""
+            sectors = []
+            segments = []
+            date = ""
             
-            # Strategy 1: Find articles using the correct card structure
-            # Look for divs that contain both 'node' and 'node--type-article' in their class
-            all_divs = soup.find_all('div')
-            article_cards = []
-            for div in all_divs:
-                class_list = div.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                if 'node' in class_str and 'node--type-article' in class_str:
-                    article_cards.append(div)
-            
-            self.logger.info(f"Found {len(article_cards)} article cards on page {page_num}")
-            
-            for i, card in enumerate(article_cards):
-                # Look for the link in card title
-                title_div = card.find('h3', class_='card__title')
-                if title_div:
-                    link = title_div.find('a', href=True)
-                    if link:
-                        href = link['href']
-                        self.logger.debug(f"Card {i}: Found link {href}")
-                        
-                        # Ensure it's a proper article link
-                        if href.startswith('/news/articles/') and href.count('/') >= 4:
-                            full_url = urljoin(self.BASE_URL, href)
-                            article_links.append(full_url)
-                            self.logger.debug(f"Card {i}: Added article link {full_url}")
-            
-            # Strategy 2: Look for stretched-link class specifically
-            if not article_links:
-                self.logger.info("Strategy 2: Looking for stretched-link elements")
-                stretched_links = soup.find_all('a', class_='stretched-link')
+            if card_container:
+                # Extract description
+                summary_elem = card_container.select_one('.field--name-field-summary, .card__body')
+                if summary_elem:
+                    description = summary_elem.get_text(strip=True)
                 
-                for i, link in enumerate(stretched_links):
-                    href = link.get('href', '')
-                    if href.startswith('/news/articles/') and href.count('/') >= 4:
-                        full_url = urljoin(self.BASE_URL, href)
-                        article_links.append(full_url)
-                        self.logger.debug(f"Stretched link {i}: Added {full_url}")
+                # Extract content type
+                type_elem = card_container.select_one('.field--name-field-report-type .field__item, .field--name-field-article-type .field__item')
+                if type_elem:
+                    content_type = type_elem.get_text(strip=True)
+                
+                # Extract sectors
+                if card_container.select_one('.field__item-electricity'):
+                    sectors.append('Electricity')
+                if card_container.select_one('.field__item-gas'):
+                    sectors.append('Gas')
+                
+                # Extract segments
+                segment_items = card_container.select('.field--name-field-segments .field__item')
+                for item in segment_items:
+                    segment = item.get_text(strip=True)
+                    if segment:
+                        segments.append(segment)
+                
+                # Extract date
+                date_elem = card_container.select_one('time[datetime]')
+                if date_elem:
+                    date = date_elem.get('datetime', date_elem.get_text(strip=True))
             
-            # Strategy 3: Fallback - H3 with card__title class
-            if not article_links:
-                self.logger.info("Strategy 3: Looking for H3 card titles")
-                h3_titles = soup.find_all('h3', class_='card__title')
-                
-                for i, h3 in enumerate(h3_titles):
-                    link = h3.find('a', href=True)
-                    if link:
-                        href = link['href']
-                        if href.startswith('/news/articles/') and href.count('/') >= 4:
-                            full_url = urljoin(self.BASE_URL, href)
-                            article_links.append(full_url)
-                            self.logger.debug(f"H3 title {i}: Added {full_url}")
+            if title and full_url:
+                related_content.append({
+                    'url': full_url,
+                    'title': title,
+                    'description': description,
+                    'type': content_type,
+                    'sectors': sectors,
+                    'segments': segments,
+                    'date': date
+                })
+        
+        return related_content
+
+    def process_embedded_files(self, embedded_links: List[Dict]) -> Dict:
+        """Process embedded links for PDF and Excel content"""
+        pdf_content = []
+        spreadsheet_content = []
+        
+        for link_info in embedded_links:
+            href = link_info['url']
+            href_lower = href.lower()
             
-            # Remove duplicates
-            unique_links = list(set(article_links))
+            if href_lower.endswith('.pdf'):
+                pdf_text = self.extract_pdf_content(href)
+                if pdf_text:
+                    pdf_content.append(pdf_text)
+            elif href_lower.endswith(('.xlsx', '.xls', '.csv')):
+                ss_text = self.extract_excel_csv_content(href)
+                if ss_text:
+                    spreadsheet_content.append(ss_text)
+        
+        return {
+            'pdf_content': pdf_content,
+            'spreadsheet_content': spreadsheet_content
+        }
+
+    def get_article_links_with_metadata(self, page_num=0) -> List[Dict]:
+        """Get article links with metadata from index page"""
+        try:
+            url = f"{self.NEWS_URL}?page={page_num}"
+            self.logger.info(f"Fetching page {page_num + 1}: {url}")
             
-            # Enhanced debugging if no articles found
-            if not unique_links:
-                self.logger.warning(f"No articles found on page {page_num}")
-                
-                # Check if we've reached the actual end by examining pagination
-                pagination_nav = soup.find('nav')
-                pagination_found = False
-                last_page_num = None
-                current_page_from_pagination = None
-                
-                if pagination_nav:
-                    # Look for pagination links
-                    page_links = pagination_nav.find_all('a')
-                    page_numbers = []
-                    
-                    # Find current page from pagination
-                    current_page_link = pagination_nav.find('a', {'aria-current': 'page'})
-                    if current_page_link:
-                        current_text = current_page_link.get_text(strip=True)
-                        try:
-                            current_page_from_pagination = int(current_text)
-                            self.logger.info(f"Current page according to pagination: {current_page_from_pagination}")
-                            
-                            # Check if we're getting the wrong page (0-based vs 1-based indexing issue)
-                            expected_page_display = page_num + 1  # Convert 0-based to 1-based
-                            if current_page_from_pagination != expected_page_display:
-                                self.logger.warning(f"Page mismatch! Expected page {expected_page_display}, but pagination shows page {current_page_from_pagination}")
-                                # This might be normal - the website might use different indexing
-                                # Let's continue and see if we find articles anyway
-                        except ValueError:
-                            pass
-                    
-                    for link in page_links:
-                        href = link.get('href', '')
-                        if 'page=' in href:
-                            try:
-                                page_val = int(href.split('page=')[1])
-                                page_numbers.append(page_val)
-                            except (ValueError, IndexError):
-                                pass
-                        
-                        # Check for "last page" link
-                        if link.get('title') == 'Go to last page':
-                            try:
-                                last_page_num = int(href.split('page=')[1])
-                                pagination_found = True
-                            except (ValueError, IndexError):
-                                pass
-                    
-                    if page_numbers:
-                        max_visible_page = max(page_numbers)
-                        self.logger.info(f"Pagination found. Current max visible page: {max_visible_page}")
-                        
-                        if last_page_num:
-                            self.logger.info(f"Last page is: {last_page_num}")
-                            
-                            # Don't stop based on pagination mismatch - the page might still have content
-                            # Only stop if we're definitely beyond the last page
-                            if page_num > last_page_num:
-                                self.logger.info("Beyond the actual last page, stopping")
-                                return []
-                        
-                        # If current page is beyond visible pagination, we might be at the end
-                        if page_num > max_visible_page:
-                            self.logger.info(f"Page {page_num} is beyond max visible page {max_visible_page}")
-                
-                # Check for the expected structure to debug detection issues
-                layout_items = soup.find_all('div', class_='views-layout__item')
-                card_titles = soup.find_all('h3', class_='card__title')
-                stretched_links = soup.find_all('a', class_='stretched-link')
-                
-                self.logger.warning(f"Page structure: {len(layout_items)} layout items, "
-                                  f"{len(card_titles)} card titles, "
-                                  f"{len(stretched_links)} stretched links")
-                
-                # Sample some links to see what we're missing
-                all_links = soup.find_all('a', href=True)
-                news_links = []
-                for link in all_links:
-                    if '/news/articles/' in link['href']:
-                        news_links.append(link['href'])
-                
-                self.logger.warning(f"Found {len(news_links)} total news links: {news_links[:10]}")
-                
-                # If we have a view-header but no articles, might be an empty results page
-                if view_header and not news_links:
-                    self.logger.info("Empty results page detected - likely reached the end")
-                    return []
+            self.driver.get(url)
+            WebDriverWait(self.driver, 45).until(
+                EC.any_of(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "h3.card__title a")),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".views-layout__item"))
+                )
+            )
             
-            self.logger.info(f"Found {len(unique_links)} unique article links on page {page_num}")
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            article_cards = soup.select('.views-layout__item')
             
-            # Log first few URLs found for verification
-            if unique_links:
-                for i, link in enumerate(unique_links[:3]):
-                    self.logger.info(f"Sample article {i+1}: {link}")
+            articles_info = []
+            for card in article_cards:
+                link_elem = card.select_one('h3.card__title a')
+                if not link_elem or not link_elem.get('href', '').startswith('/news/articles/'):
+                    continue
+                
+                article_url = urljoin(self.BASE_URL, link_elem['href'])
+                article_info = {
+                    'url': article_url,
+                    'title': link_elem.get_text(strip=True),
+                    'article_type': self.extract_article_type_from_index(card),
+                    'sectors': self.extract_sectors_from_index(card),
+                    'segments': self.extract_segments_from_index(card)
+                }
+                articles_info.append(article_info)
             
-            return unique_links
+            self.logger.info(f"Found {len(articles_info)} valid articles on page {page_num + 1}")
+            return articles_info
             
         except Exception as e:
-            self.logger.error(f"Error getting article links from page {page_num}: {e}")
+            self.logger.error(f"Failed to get links for page {page_num + 1}: {e}")
             return []
 
-    def parse_article_page(self, url):
-        """Parse individual article page"""
+    def parse_article(self, article_info: Dict) -> Optional[Dict]:
+        """Parse article with comprehensive content extraction"""
+        url = article_info['url']
         try:
-            self.logger.info(f"Parsing article: {url}")
+            self.logger.info(f"Parsing: {article_info.get('title', 'Unknown')}")
             
-            soup = self.get_page_content(url)
-            if not soup:
-                return None
+            self.driver.get(url)
+            WebDriverWait(self.driver, 45).until(
+                EC.presence_of_element_located((By.TAG_NAME, "h1"))
+            )
             
-            # Extract title from H1
-            title = ""
-            title_elem = soup.find('h1')
-            if title_elem:
-                title = title_elem.get_text(strip=True)
-            
-            # Extract content from the body field
-            content = ""
-            # Look for field--name-field-body in class names
-            all_divs = soup.find_all('div')
-            for div in all_divs:
-                class_list = div.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                if 'field--name-field-body' in class_str:
-                    content = div.get_text(strip=True)
-                    break
-            
-            # Fallback content selectors
-            if not content:
-                content_candidates = [
-                    soup.find('div', class_='block-body'),
-                    soup.find('main'),
-                ]
-                
-                # Also check for any div with 'content' in class name
-                for div in all_divs:
-                    class_list = div.get('class', [])
-                    class_str = ' '.join(class_list) if class_list else ''
-                    if 'content' in class_str.lower():
-                        content_candidates.append(div)
-                        break
-                
-                for elem in content_candidates:
-                    if elem:
-                        content = elem.get_text(strip=True)
-                        if content:  # Only use if non-empty
-                            break
-            
-            # Extract article type
-            article_type = "News Release"  # Default
-            for div in all_divs:
-                class_list = div.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                if 'field--name-field-article-type' in class_str:
-                    type_item = div.find('div', class_='field__item')
-                    if type_item:
-                        type_text = type_item.get_text(strip=True).lower()
-                        if 'communication' in type_text:
-                            article_type = "Communications"
-                        elif 'speech' in type_text:
-                            article_type = "Speeches"
-                        elif 'news release' in type_text:
-                            article_type = "News Release"
-                        else:
-                            article_type = type_item.get_text(strip=True)
-                    break
-            
-            # Extract category from segments field
-            category = "General"  # Default
-            segments = []
-            for div in all_divs:
-                class_list = div.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                if 'field--name-field-segments' in class_str:
-                    segment_items = div.find_all('div', class_='field__item')
-                    if segment_items:
-                        segments = [item.get_text(strip=True) for item in segment_items]
-                        # Use the first segment as category
-                        if segments:
-                            first_segment = segments[0].lower()
-                            if 'distribution' in first_segment:
-                                category = "Distribution"
-                            elif 'retail' in first_segment:
-                                category = "Retail"
-                            elif 'transmission' in first_segment:
-                                category = "Transmission"
-                            elif 'wholesale' in first_segment:
-                                category = "Wholesale"
-                            else:
-                                category = segments[0]
-                    break
-            
-            # Extract sectors
-            sectors = []
-            for div in all_divs:
-                class_list = div.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                if 'field--name-field-sectors' in class_str:
-                    sector_items = div.find_all('div', class_='field__item')
-                    sectors = [item.get_text(strip=True) for item in sector_items]
-                    break
-            
-            # If no category from segments, try sectors
-            if category == "General" and sectors:
-                category = sectors[0]
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+
+            # Extract basic information
+            title = soup.find('h1').get_text(strip=True) if soup.find('h1') else article_info.get('title', 'N/A')
             
             # Extract date
-            published_date = ""
-            for div in all_divs:
-                class_list = div.get('class', [])
-                class_str = ' '.join(class_list) if class_list else ''
-                if 'field--name-field-date' in class_str:
-                    time_elem = div.find('time')
-                    if time_elem:
-                        published_date = time_elem.get('datetime', '')
-                        if not published_date:
-                            published_date = time_elem.get_text(strip=True)
-                    break
+            date = ""
+            date_elem = soup.select_one('div.field--name-field-date time, time[datetime]')
+            if date_elem:
+                date = date_elem.get('datetime', date_elem.get_text(strip=True))
             
-            # Fallback date extraction
-            if not published_date:
-                page_text = soup.get_text()
-                # Simple date patterns
-                patterns = [
-                    r'\d{1,2}\s+\w+\s+\d{4}',
-                    r'\d{4}-\d{2}-\d{2}',
-                    r'\d{1,2}/\d{1,2}/\d{4}'
-                ]
-                
-                for pattern in patterns:
-                    match = re.search(pattern, page_text)
-                    if match:
-                        published_date = match.group(0)
-                        break
-            
+            # Extract main content
+            main_content = ""
+            body_elem = soup.find('div', class_='field--name-field-body')
+            if body_elem:
+                main_content = self.clean_text_for_llm(body_elem.get_text(strip=True))
+
+            # Extract article type from content page
+            article_type = ""
+            type_elem = soup.select_one('div.field--name-field-article-type .field__item')
+            if type_elem:
+                article_type = type_elem.get_text(strip=True)
+            else:
+                article_type = article_info.get('article_type', '')
+
+            # Extract sectors
+            sectors = []
+            sector_items = soup.select('div.field--name-field-sectors .field__item')
+            for item in sector_items:
+                sector = item.get_text(strip=True)
+                if sector:
+                    sectors.append(sector)
+            if not sectors:
+                sectors = article_info.get('sectors', [])
+
+            # Extract segments
+            segments = []
+            segment_items = soup.select('div.field--name-field-segments .field__item')
+            for item in segment_items:
+                segment = item.get_text(strip=True)
+                if segment:
+                    segments.append(segment)
+            if not segments:
+                segments = article_info.get('segments', [])
+
+            # Extract theme from breadcrumbs
+            theme = ""
+            breadcrumbs = soup.select('nav.breadcrumb a')
+            if len(breadcrumbs) > 1:
+                theme = breadcrumbs[-1].get_text(strip=True)
+
             # Extract image
             image_url = ""
-            images = soup.find_all('img')
-            for img in images:
-                img_class = ' '.join(img.get('class', []))
-                if any(keyword in img_class.lower() for keyword in ['hero', 'featured', 'main']):
-                    if img.get('src'):
-                        image_url = urljoin(self.BASE_URL, img['src'])
-                        break
+            img_elem = soup.select_one('.field--name-field-body img')
+            if img_elem and img_elem.get('src'):
+                image_url = urljoin(self.BASE_URL, img_elem['src'])
+
+            # Extract tables
+            tables_content = []
+            for table in soup.select('.field--name-field-body table'):
+                table_text = self.clean_text_for_llm(table.get_text())
+                if table_text:
+                    tables_content.append(table_text)
+
+            # Extract ALL embedded links from content
+            embedded_links = self.extract_all_embedded_links(soup)
             
-            # If no featured image found, use first image
-            if not image_url and images:
-                first_img = images[0]
-                if first_img.get('src'):
-                    image_url = urljoin(self.BASE_URL, first_img['src'])
+            # Extract related content
+            related_content = self.extract_related_content(soup)
             
-            # Extract related links
-            related_links = self.extract_links_from_content(soup, self.BASE_URL)
-            
-            # Check for PDF links and extract content
-            pdf_content = ""
-            all_links = soup.find_all('a', href=True)
-            pdf_links = []
-            for link in all_links:
-                href = link.get('href', '')
-                if href.lower().endswith('.pdf'):
-                    pdf_links.append(link)
-            
-            if pdf_links:
-                # Use the first PDF link as specified
-                first_pdf = pdf_links[0]
-                pdf_url = urljoin(self.BASE_URL, first_pdf['href'])
-                pdf_content = self.extract_pdf_text(pdf_url)
-                
-                # If main content is minimal but PDF has content, use PDF content
-                if len(content) < 200 and len(pdf_content) > 200:
-                    content = pdf_content
-            
+            # Process files from embedded links
+            file_content = self.process_embedded_files(embedded_links)
+
+            # Build clean article data structure
             article_data = {
                 'url': url,
-                'title': title,
-                'content': content,
-                'pdf_content': pdf_content,
-                'article_type': article_type,
-                'category': category,
-                'sectors': sectors,
-                'published_date': published_date,
+                'headline': title,
+                'published_date': date,
                 'scraped_date': datetime.now().isoformat(),
+                'article_type': article_type,
+                'theme': theme,
+                'sectors': sectors,
+                'segments': segments,
                 'image_url': image_url,
-                'related_links': related_links
+                'main_content': main_content,
+                'embedded_links': embedded_links,
+                'related_content': related_content
             }
             
+            # Only add optional fields if they contain data
+            if tables_content:
+                article_data['tables_and_data'] = ' '.join(tables_content)
+            
+            if file_content['pdf_content']:
+                article_data['pdf_content'] = ' '.join(file_content['pdf_content'])
+            
+            if file_content['spreadsheet_content']:
+                article_data['spreadsheet_content'] = ' '.join(file_content['spreadsheet_content'])
+            
+            self.logger.info(f"Successfully parsed: {title[:50]}... (Type: {article_type}, Links: {len(embedded_links)})")
             return article_data
             
         except Exception as e:
-            self.logger.error(f"Error parsing article {url}: {e}")
+            self.logger.error(f"Failed to parse article {url}: {e}")
             return None
 
-    def scrape_all_articles(self):
-        """Main method to scrape all articles"""
+    def save_results(self):
+        """Save results to single JSON file"""
         try:
-            # Establish session first
-            if not self.establish_session():
-                self.logger.error("Failed to establish session")
-                return
+            all_articles = list(self.existing_articles.values())
             
-            all_articles = []
-            new_articles_count = 0
-            consecutive_empty_pages = 0
-            max_consecutive_empty = 3  # Stop after 3 consecutive empty pages
-            session_refresh_interval = 20  # Refresh session every 20 pages
-            
-            # Get article links from all pages
-            for page_num in range(self.MAX_PAGES):
-                self.logger.info(f"Processing page {page_num + 1}/{self.MAX_PAGES}")
-                
-                # Refresh session periodically to avoid timeouts
-                if page_num > 0 and page_num % session_refresh_interval == 0:
-                    self.logger.info("Refreshing session to avoid timeouts...")
-                    self.establish_session()
-                
-                article_links = self.get_article_links_from_page(page_num)
-                
-                if not article_links:
-                    consecutive_empty_pages += 1
-                    self.logger.warning(f"No articles found on page {page_num} ({consecutive_empty_pages} consecutive empty pages)")
-                    
-                    if consecutive_empty_pages >= max_consecutive_empty:
-                        self.logger.info(f"Stopping after {consecutive_empty_pages} consecutive empty pages")
-                        break
-                    else:
-                        # Continue to next page - might be a temporary issue
-                        self.logger.info(f"Continuing to next page (allowing up to {max_consecutive_empty} empty pages)")
-                        
-                        # Add extra delay after empty pages to avoid overwhelming server
-                        time.sleep(random.uniform(5, 10))
-                        continue
-                else:
-                    # Reset counter when we find articles
-                    consecutive_empty_pages = 0
-                    self.logger.info(f"Found {len(article_links)} articles on page {page_num}")
-                
-                # Process each article
-                for link in article_links:
-                    # Check if article already exists (deduplication)
-                    if link in self.existing_articles:
-                        self.logger.info(f"Article already exists, skipping: {link}")
-                        continue
-                    
-                    # Parse the article
-                    article_data = self.parse_article_page(link)
-                    
-                    if article_data:
-                        all_articles.append(article_data)
-                        new_articles_count += 1
-                        self.logger.info(f"Successfully scraped: {article_data['title'][:50]}...")
-                        
-                        # Add delay between articles
-                        time.sleep(random.uniform(2, 5))
-                    else:
-                        self.logger.warning(f"Failed to parse article: {link}")
-                    
-                    # Add delay to avoid overwhelming the server
-                    time.sleep(random.uniform(1, 3))
-                
-                # Add longer delay between pages
-                time.sleep(random.uniform(3, 7))
-            
-            # Combine with existing articles
-            combined_articles = list(self.existing_articles.values()) + all_articles
-            
-            # Save results
-            self.save_results(combined_articles)
-            
-            self.logger.info(f"Scraping completed. New articles: {new_articles_count}, Total articles: {len(combined_articles)}")
-            
-        except KeyboardInterrupt:
-            self.logger.info("Scraping interrupted by user")
-        except Exception as e:
-            self.logger.error(f"Error in main scraping process: {e}")
-        finally:
-            self.close_selenium_driver()
-
-    def save_results(self, articles):
-        """Save results to JSON and CSV files"""
-        try:
-            # Save JSON
             with open(self.JSON_FILE, 'w', encoding='utf-8') as f:
-                json.dump(articles, f, indent=2, ensure_ascii=False)
+                json.dump(all_articles, f, indent=2, ensure_ascii=False, sort_keys=True)
             
-            # Save CSV - handle dynamic fieldnames
-            if articles:
-                # Get all possible fieldnames from all articles
-                all_fieldnames = set()
-                for article in articles:
-                    all_fieldnames.update(article.keys())
-                
-                # Define our expected fieldnames in order
-                expected_fieldnames = [
-                    'url', 'title', 'content', 'pdf_content', 'article_type', 
-                    'category', 'sectors', 'published_date', 'scraped_date', 'image_url', 'related_links'
-                ]
-                
-                # Add any extra fieldnames that exist in the data
-                extra_fieldnames = sorted(all_fieldnames - set(expected_fieldnames))
-                fieldnames = expected_fieldnames + extra_fieldnames
-                
-                with open(self.CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    
-                    for article in articles:
-                        # Create CSV row with all possible fields
-                        csv_article = {}
-                        for field in fieldnames:
-                            value = article.get(field, '')
-                            
-                            # Convert complex types to strings for CSV
-                            if isinstance(value, (list, dict)):
-                                csv_article[field] = json.dumps(value, ensure_ascii=False)
-                            else:
-                                csv_article[field] = value
-                        
-                        writer.writerow(csv_article)
+            # Generate summary for console
+            stats = {'total_articles': len(all_articles), 'by_type': {}}
+            for article in all_articles:
+                article_type = article.get('article_type', 'Unknown')
+                stats['by_type'][article_type] = stats['by_type'].get(article_type, 0) + 1
             
-            self.logger.info(f"Results saved to {self.JSON_FILE} and {self.CSV_FILE}")
+            self.logger.info(f"Saved {stats['total_articles']} articles")
+            self.logger.info(f"Types: {dict(stats['by_type'])}")
             
         except Exception as e:
             self.logger.error(f"Error saving results: {e}")
-            # Save what we can in JSON format at least
+
+    def handle_session_recovery(self) -> bool:
+        """Handle session recovery when driver fails"""
+        self.session_retry_count += 1
+        if self.session_retry_count >= self.max_session_retries:
+            self.logger.error(f"Max session retries reached. Stopping.")
+            return False
+        
+        self.logger.warning(f"Session recovery attempt {self.session_retry_count}")
+        time.sleep(random.uniform(10, 20))
+        return self.establish_session()
+
+    def scrape_all_articles(self):
+        """Main scraping method"""
+        if not self.establish_session():
+            self.logger.error("Failed to establish initial session. Exiting.")
+            return
+        
+        self.logger.info("Starting enhanced news scraping...")
+        new_articles_count = 0
+        consecutive_empty_pages = 0
+        
+        try:
+            for page_num in range(self.MAX_PAGES):
+                self.logger.info(f"--- Processing page {page_num + 1}/{self.MAX_PAGES} ---")
+                
+                try:
+                    articles_info = self.get_article_links_with_metadata(page_num)
+                    
+                    if not articles_info:
+                        consecutive_empty_pages += 1
+                        if consecutive_empty_pages >= 3:
+                            self.logger.info("Reached end of available pages.")
+                            break
+                        continue
+                    
+                    consecutive_empty_pages = 0
+
+                    for article_info in articles_info:
+                        url = article_info['url']
+                        
+                        if url in self.existing_articles:
+                            continue
+                        
+                        self.processed_files.clear()  # Reset for each article
+                        
+                        try:
+                            article = self.parse_article(article_info)
+                            if article:
+                                self.existing_articles[url] = article
+                                new_articles_count += 1
+                        except Exception as article_error:
+                            self.logger.error(f"Error processing article {url}: {article_error}")
+                        
+                        # Save progress periodically
+                        if new_articles_count > 0 and new_articles_count % 25 == 0:
+                            self.save_results()
+
+                        time.sleep(random.uniform(1, 3))
+                    
+                    time.sleep(random.uniform(2, 5))
+                
+                except Exception as page_error:
+                    self.logger.error(f"Error processing page {page_num + 1}: {page_error}")
+                    if not self.handle_session_recovery():
+                        break
+                
+        except KeyboardInterrupt:
+            self.logger.warning("Scraping interrupted by user.")
+        except Exception as e:
+            self.logger.error(f"Critical error: {e}")
+        finally:
+            self.logger.info(f"Scraping completed. New articles: {new_articles_count}")
+            self.save_results()
+            self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources"""
+        self.logger.info("Cleaning up...")
+        if self.driver:
             try:
-                with open(self.JSON_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(articles, f, indent=2, ensure_ascii=False)
-                self.logger.info("At least JSON file was saved successfully")
-            except Exception as json_error:
-                self.logger.error(f"Failed to save even JSON file: {json_error}")
+                self.driver.quit()
+            except:
+                pass
+        if self.session:
+            try:
+                self.session.close()
+            except:
+                pass
+
+    def get_scraper_stats(self) -> Dict:
+        """Get statistics about scraped data"""
+        if not os.path.exists(self.JSON_FILE):
+            return {"error": "No data file found"}
+        
+        try:
+            with open(self.JSON_FILE, 'r', encoding='utf-8') as f:
+                articles = json.load(f)
+            
+            stats = {
+                'total_articles': len(articles),
+                'article_types': {},
+                'with_embedded_links': 0,
+                'with_related_content': 0,
+                'with_files': 0
+            }
+            
+            for article in articles:
+                article_type = article.get('article_type', 'Unknown')
+                stats['article_types'][article_type] = stats['article_types'].get(article_type, 0) + 1
+                
+                if article.get('embedded_links'):
+                    stats['with_embedded_links'] += 1
+                if article.get('related_content'):
+                    stats['with_related_content'] += 1
+                if article.get('pdf_content') or article.get('spreadsheet_content'):
+                    stats['with_files'] += 1
+            
+            return stats
+            
+        except Exception as e:
+            return {"error": f"Failed to generate stats: {e}"}
+
 
 def main():
-    """Main function"""
-    # The website appears to have pages 0-7 working (96 articles / 12 per page = 8 pages)
-    # Let's be more conservative and focus on getting those pages reliably
-    MAX_PAGES = 3  # Reduced to focus on pages that likely exist
+    print("=" * 80)
+    print("Enhanced AER News Scraper for LLM Analysis")
+    print("=" * 80)
+    print("Features:")
+    print("• Extracts article types (Communication, News Release, Speech)")
+    print("• Captures ALL embedded links within article content")
+    print("• Enhanced PDF and Excel/CSV content extraction")
+    print("• Extracts related content with full metadata")
+    print("• Clean output structure for LLM processing")
+    print("=" * 80)
     
-    scraper = AERScraper(max_pages=MAX_PAGES)
-    scraper.scrape_all_articles()
+    scraper = EnhancedAERNewsScraper()
+    
+    try:
+        scraper.scrape_all_articles()
+    except Exception as e:
+        print(f"Critical error in main: {e}")
+    finally:
+        print("\n" + "=" * 80)
+        print("SCRAPING COMPLETED - FINAL STATISTICS")
+        print("=" * 80)
+        
+        stats = scraper.get_scraper_stats()
+        if 'error' not in stats:
+            print(f"Total articles: {stats['total_articles']}")
+            print(f"Article types: {dict(stats['article_types'])}")
+            print(f"Articles with embedded links: {stats['with_embedded_links']}")
+            print(f"Articles with related content: {stats['with_related_content']}")
+            print(f"Articles with files: {stats['with_files']}")
+        else:
+            print(f"Stats error: {stats['error']}")
+        
+        print(f"Output saved to: {scraper.JSON_FILE}")
+        print("=" * 80)
+
 
 if __name__ == "__main__":
     main()

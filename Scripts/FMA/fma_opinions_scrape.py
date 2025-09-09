@@ -28,7 +28,7 @@ from fake_useragent import UserAgent
 BASE_URL = "https://www.fma.govt.nz"
 OPINIONS_URL = f"{BASE_URL}/library/opinion/"
 DATA_DIR = "data"
-MAX_PAGES = 3  # Set to 3 for daily runs, 10+ for initial full scrape
+MAX_PAGES = 1  # Set to 3 for daily runs, 10+ for initial full scrape
 DELAY_RANGE = (2, 5)  # Random delay between requests (seconds)
 DAYS_LOOKBACK = 30  # For daily runs, only scrape opinions from last 30 days (opinions are less frequent)
 

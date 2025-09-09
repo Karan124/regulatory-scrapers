@@ -41,7 +41,7 @@ import pdfplumber
 from bs4 import BeautifulSoup
 
 # Configuration
-MAX_PAGE = 3  # Set to None for initial run (scrape all), or set to 3 for daily runs
+MAX_PAGE = 2  # Set to None for initial run (scrape all), or set to 3 for daily runs
 BASE_URL = "https://aemo.com.au"
 MEDIA_URL = "https://aemo.com.au/newsroom/media-release"
 DATA_DIR = Path("data")
@@ -223,9 +223,9 @@ class AEMOMediaScraper:
         except Exception as e:
             logger.error(f"Failed to save processed articles: {e}")
 
-    def get_article_identifier(self, url: str, title: str) -> str:
+    def get_article_identifier(self, url: str, title: str, published_date: str = "") -> str:
         """Generate unique identifier for article"""
-        content = f"{url}|{title}".encode('utf-8')
+        content = f"{url}|{title}|{published_date}".encode('utf-8')
         return hashlib.md5(content).hexdigest()
 
     def get_page_content(self, url: str, use_driver: bool = True) -> Optional[BeautifulSoup]:
@@ -281,7 +281,7 @@ class AEMOMediaScraper:
             pub_date = date_elem.get_text(strip=True) if date_elem else ""
             abstract = abstract_elem.get_text(strip=True) if abstract_elem else ""
             
-            article_id = self.get_article_identifier(full_url, title)
+            article_id = self.get_article_identifier(full_url, title, pub_date)
             
             if article_id in self.processed_articles:
                 logger.info(f"Skipping already processed media release: {title}")

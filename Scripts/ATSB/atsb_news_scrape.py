@@ -31,7 +31,7 @@ import undetected_chromedriver as uc
 # Configuration
 BASE_URL = "https://www.atsb.gov.au"
 NEWS_URL = f"{BASE_URL}/news"
-MAX_PAGES = 3  # Total pages available - adjust for daily runs (set to 3)
+MAX_PAGES = 1  # Total pages available - adjust for daily runs (set to 3)
 DAILY_RUN_PAGES = 3  # For scheduled daily runs
 OUTPUT_DIR = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "atsb_news.json"

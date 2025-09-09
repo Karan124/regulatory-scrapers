@@ -2,7 +2,7 @@
 """
 RBNZ Consultations Scraper
 Scrapes all consultations from the Reserve Bank of New Zealand consultations page
-with working pagination and rate limiting.
+with working pagination, rate limiting, and status change tracking.
 """
 
 import json
@@ -40,7 +40,7 @@ CONFIG = {
     'RATE_LIMIT': 292,  # requests per hour
     'REQUEST_DELAY': 3600 / 292,  # seconds between requests (~12.3 seconds)
     'SAFETY_MARGIN': 0.8,  # Use only 80% of allowed rate for safety
-    'MAX_PAGE': 1,  # Set to None for full scrape, or integer for limited pages
+    'MAX_PAGE': 2,  # Set to None for full scrape, or integer for limited pages
     'OUTPUT_DIR': './data',
     'OUTPUT_FILE': './data/rbnz_consultations.json',
     'LOG_FILE': './consultations_scrape.log',
@@ -132,6 +132,48 @@ class RBNZConsultationsScraper:
                 json.dump(list(self.scraped_urls), f, indent=2)
         except Exception as e:
             self.logger.error(f"Could not save scraped URLs: {e}")
+
+    def _should_rescrape_consultation(self, url: str) -> bool:
+        """Determine if a consultation should be re-scraped (e.g., to check for status changes)"""
+        try:
+            if not os.path.exists(CONFIG['OUTPUT_FILE']):
+                return True
+                
+            with open(CONFIG['OUTPUT_FILE'], 'r', encoding='utf-8') as f:
+                existing_consultations = json.load(f)
+                
+            # Find existing consultation
+            existing_cons = None
+            for cons in existing_consultations:
+                if cons.get('url') == url:
+                    existing_cons = cons
+                    break
+                    
+            if not existing_cons:
+                return True  # New consultation
+                
+            # Always re-scrape Open consultations to check if they've closed
+            if existing_cons.get('status') == 'Open' or existing_cons.get('consultation_status') == 'Open':
+                self.logger.info(f"Re-scraping open consultation: {url}")
+                return True
+                
+            # Re-scrape if last update was more than 7 days ago
+            last_scraped = existing_cons.get('scraped_date')
+            if last_scraped:
+                try:
+                    scraped_datetime = datetime.fromisoformat(last_scraped.replace('Z', '+00:00'))
+                    days_since_scrape = (datetime.now() - scraped_datetime.replace(tzinfo=None)).days
+                    if days_since_scrape > 7:
+                        self.logger.info(f"Re-scraping old consultation ({days_since_scrape} days): {url}")
+                        return True
+                except Exception:
+                    return True  # Re-scrape if date parsing fails
+                    
+            return False  # Skip re-scraping
+            
+        except Exception as e:
+            self.logger.warning(f"Error checking if should re-scrape {url}: {e}")
+            return True  # Default to re-scraping on error
 
     def _rate_limit(self):
         """Implement smart rate limiting with request tracking"""
@@ -476,9 +518,12 @@ class RBNZConsultationsScraper:
         return False
 
     def _extract_consultation_content(self, consultation_url: str) -> Optional[Dict]:
-        """Extract content from a single consultation with enhanced extraction for consultation-specific elements"""
-        if consultation_url in self.scraped_urls:
-            return None
+        """Extract content from a single consultation with status change detection"""
+        
+        # Check if we should re-scrape this consultation
+        if not self._should_rescrape_consultation(consultation_url):
+            self.logger.info(f"Skipping {consultation_url} - recently scraped and closed")
+            return "SKIPPED"
             
         try:
             response = self._safe_request(consultation_url)
@@ -742,7 +787,7 @@ class RBNZConsultationsScraper:
             return {
                 'url': consultation_url,
                 'title': title,
-                'status': status,  # Added status field based on closed_date presence
+                'status': status,
                 'consultation_status': consultation_status,
                 'opened_date': opened_date,
                 'closed_date': closed_date,
@@ -794,9 +839,11 @@ class RBNZConsultationsScraper:
             self.logger.info(f"Processing consultation {i}/{len(consultation_urls)}: {url}")
             
             consultation_data = self._extract_consultation_content(url)
-            if consultation_data:
+            if consultation_data and consultation_data != "SKIPPED":
                 consultations.append(consultation_data)
                 self.logger.info(f"✓ Scraped: {consultation_data['title'][:60]}...")
+            elif consultation_data == "SKIPPED":
+                self.logger.info(f"→ Skipped (recently scraped and closed): {url}")
                 
                 # Save progress every 10 consultations
                 if len(consultations) % 10 == 0:
@@ -830,7 +877,7 @@ class RBNZConsultationsScraper:
             self.logger.error(f"Error saving progress: {e}")
             
     def save_results(self, consultations: List[Dict]):
-        """Save scraped consultations to JSON file"""
+        """Save scraped consultations to JSON file with status change tracking"""
         try:
             # Load existing consultations
             existing_consultations = []
@@ -838,17 +885,69 @@ class RBNZConsultationsScraper:
                 with open(CONFIG['OUTPUT_FILE'], 'r', encoding='utf-8') as f:
                     existing_consultations = json.load(f)
                     
-            # Merge with new consultations
-            existing_urls = {cons.get('url') for cons in existing_consultations}
-            new_consultations = [cons for cons in consultations if cons.get('url') not in existing_urls]
+            # Create a mapping of existing consultations by URL
+            existing_by_url = {cons.get('url'): cons for cons in existing_consultations}
             
-            all_consultations = existing_consultations + new_consultations
+            # Process new consultations
+            all_consultations = []
+            new_count = 0
+            updated_count = 0
             
+            for new_cons in consultations:
+                url = new_cons.get('url')
+                if not url:
+                    continue
+                    
+                if url in existing_by_url:
+                    existing_cons = existing_by_url[url]
+                    
+                    # Check if status or other key fields have changed
+                    status_changed = (
+                        existing_cons.get('status') != new_cons.get('status') or
+                        existing_cons.get('consultation_status') != new_cons.get('consultation_status') or
+                        existing_cons.get('opened_date') != new_cons.get('opened_date') or
+                        existing_cons.get('closed_date') != new_cons.get('closed_date')
+                    )
+                    
+                    if status_changed:
+                        # Log the status change
+                        old_status = existing_cons.get('status', 'Unknown')
+                        new_status = new_cons.get('status', 'Unknown')
+                        self.logger.info(f"Status change detected: {url} - {old_status} -> {new_status}")
+                        
+                        # Update the consultation data
+                        # Keep original scraped_date but add update info
+                        new_cons['original_scraped_date'] = existing_cons.get('scraped_date')
+                        new_cons['last_updated_date'] = datetime.now().isoformat()
+                        new_cons['status_change_history'] = existing_cons.get('status_change_history', [])
+                        new_cons['status_change_history'].append({
+                            'date': datetime.now().isoformat(),
+                            'old_status': old_status,
+                            'new_status': new_status,
+                            'old_consultation_status': existing_cons.get('consultation_status'),
+                            'new_consultation_status': new_cons.get('consultation_status')
+                        })
+                        
+                        updated_count += 1
+                    
+                    # Always use the newer version (in case other fields updated)
+                    all_consultations.append(new_cons)
+                    # Remove from existing mapping so we don't add it again
+                    del existing_by_url[url]
+                else:
+                    # Completely new consultation
+                    new_count += 1
+                    all_consultations.append(new_cons)
+            
+            # Add any remaining existing consultations that weren't updated
+            for remaining_cons in existing_by_url.values():
+                all_consultations.append(remaining_cons)
+                
             # Save combined results
             with open(CONFIG['OUTPUT_FILE'], 'w', encoding='utf-8') as f:
                 json.dump(all_consultations, f, indent=2, ensure_ascii=False)
                 
-            self.logger.info(f"Saved {len(new_consultations)} new consultations. Total: {len(all_consultations)}")
+            self.logger.info(f"Saved results: {new_count} new, {updated_count} updated, {len(all_consultations)} total consultations")
             
             # Save scraped URLs
             self._save_scraped_urls()
@@ -858,6 +957,8 @@ class RBNZConsultationsScraper:
             
         except Exception as e:
             self.logger.error(f"Error saving results: {e}")
+            import traceback
+            self.logger.debug(f"Full traceback: {traceback.format_exc()}")
             
     def _save_request_stats(self):
         """Save request statistics for monitoring"""
@@ -915,6 +1016,8 @@ def main():
                        help='Resume from previous progress file')
     parser.add_argument('--batch-size', type=int, default=50,
                        help='Number of consultations to scrape in this batch')
+    parser.add_argument('--force-update-open', action='store_true',
+                       help='Force re-scraping of all open consultations')
     
     args = parser.parse_args()
     
@@ -956,9 +1059,19 @@ def main():
     if args.batch_size:
         print(f"Processing in batches of {args.batch_size} consultations")
         scraper.batch_size = args.batch_size
+        
+    if args.force_update_open:
+        print("Force updating all open consultations...")
+        # This flag affects the _should_rescrape_consultation method behavior
+        scraper.force_update_open = True
     
     scraper.run()
 
 
 if __name__ == "__main__":
     main()
+
+    # python rbnz_scraper.py \
+    # --use-selenium \
+    # --max-pages 2 \
+    # --force-update-open \

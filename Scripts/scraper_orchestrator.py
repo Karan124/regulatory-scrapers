@@ -672,6 +672,7 @@ DETAILED RESULTS:
             ("ACMA News", "ACMA", ["acma_all_news_scrape.py"], 480, "complex"),
             ("OAIC", "OAIC", None, 300, "standard"),
             ("NTC", "NTC", None, 300, "standard"),
+            ("ATSB", "ATSB", None, 300, "standard"),
             ("ABS", "ABS", None, 300, "standard"),
             ("AER News", "AER", ["aer_news_scrape.py"], 300, "standard"),
             ("AER Resources", "AER", ["aer_resources_scrape.py"], 300, "standard"),
