@@ -210,7 +210,9 @@ class RBAConsultationsScraper:
 
     def generate_consultation_id(self, consultation: Dict) -> str:
         """Generate a unique ID for a consultation based on URL and title."""
-        content = f"{consultation['url']}{consultation['title']}"
+        title = consultation.get('title') or consultation.get('headline', '')
+        url = consultation.get('url', '')
+        content = f"{url}{title}"
         return hashlib.md5(content.encode()).hexdigest()
 
     def extract_page_content(self, url: str) -> Dict:
@@ -576,7 +578,8 @@ class RBAConsultationsScraper:
         for i, consultation in enumerate(updated_consultations, 1):
             consultation_id = self.generate_consultation_id(consultation)
             
-            self.logger.info(f"Processing consultation {i}/{len(updated_consultations)}: {consultation['title']}")
+            title_or_headline = consultation.get('title') or consultation.get('headline', 'Unknown')
+            self.logger.info(f"Processing consultation {i}/{len(updated_consultations)}: {title_or_headline}")
             
             # Check if we need to scrape content
             needs_scraping = (
