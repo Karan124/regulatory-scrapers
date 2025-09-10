@@ -591,7 +591,7 @@ class RBAConsultationsScraper:
                 content_data = self.extract_page_content(consultation['url'])
                 
                 if 'error' in content_data:
-                    self.logger.error(f"Failed to extract content for: {consultation['title']}")
+                    self.logger.error(f"Failed to extract content for: {consultation.get('title', consultation.get('headline', 'Unknown'))}")
                     # Use existing data if available
                     if consultation_id in self.existing_data:
                         final_consultation = self.existing_data[consultation_id]
@@ -602,12 +602,18 @@ class RBAConsultationsScraper:
                     else:
                         # Create minimal entry
                         final_consultation = consultation.copy()
-                        final_consultation['headline'] = final_consultation.pop('title')
+                        title_field = consultation.get('title') or consultation.get('headline', 'Unknown')
+                        final_consultation['headline'] = title_field
+                        if 'title' in final_consultation:
+                            final_consultation.pop('title')
                         final_consultation.update(content_data)  # Include error
                 else:
                     # Successful extraction
                     consultation.update(content_data)
-                    consultation['headline'] = consultation.pop('title')
+                    title_field = consultation.get('title') or consultation.get('headline', 'Unknown')
+                    consultation['headline'] = title_field
+                    if 'title' in consultation:
+                        consultation.pop('title')
                     
                     # Clean up temporary flags
                     consultation.pop('_is_new', None)
@@ -622,7 +628,7 @@ class RBAConsultationsScraper:
                 
                 self.logger.info(f"Processed content for: {final_consultation.get('headline', 'Unknown')}")
             else:
-                # Use existing data
+                # Use existing data (already has 'headline' field)
                 final_consultation = self.existing_data[consultation_id]
                 self.logger.info(f"Using existing data for: {final_consultation.get('headline', 'Unknown')}")
             
