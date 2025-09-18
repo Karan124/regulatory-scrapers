@@ -89,7 +89,7 @@ class RBAScraper:
     MAX_RETRIES = 3
     TIMEOUT = 30
     PDF_TIMEOUT = 60
-    MAX_PAGES = 100  # Safety limit for pagination
+    MAX_PAGES = 2  # Safety limit for pagination
     
     def __init__(self, output_dir: str = "data", log_level: str = "INFO", max_years: Optional[int] = None):
         """

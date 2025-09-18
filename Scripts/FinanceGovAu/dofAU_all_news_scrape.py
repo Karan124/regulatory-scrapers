@@ -28,15 +28,7 @@ import PyPDF2
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
-try:
-    # Try both common import patterns for playwright-stealth
-    try:
-        from playwright_stealth import stealth_sync as stealth
-    except ImportError:
-        from playwright_stealth import stealth
-except ImportError:
-    stealth = None
-    logging.warning("playwright-stealth not available. Running without stealth measures.")
+STEALTH_AVAILABLE = False
 
 # --- ENHANCED CONFIGURATION ---
 
@@ -572,13 +564,7 @@ def scrape_site_enhanced(context: BrowserContext, existing_urls: Set[str], run_t
 
 def apply_stealth(page):
     """Apply stealth measures if available."""
-    if stealth:
-        try:
-            stealth(page)
-        except Exception as e:
-            logging.warning(f"Could not apply stealth measures: {e}")
-    else:
-        logging.info("Running without stealth measures")
+    pass
 
 def save_enhanced_data(all_articles: List[Dict]):
     """Save enhanced data with metadata to JSON and CSV files."""
